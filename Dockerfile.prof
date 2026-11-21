@@ -1,0 +1,8 @@
+FROM rust:1-bookworm
+RUN apt-get update -qq && apt-get install -y -qq linux-perf >/dev/null 2>&1 || true
+WORKDIR /src
+COPY Cargo.toml Cargo.lock* ./
+RUN mkdir src && echo 'fn main(){}' > src/main.rs && cargo build --release && rm -rf src target/release/deps/sessions*
+COPY src ./src
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes"
+RUN sed -i 's/debug = false/debug = 1/' Cargo.toml && cargo build --release && cp target/release/sessions /sessions

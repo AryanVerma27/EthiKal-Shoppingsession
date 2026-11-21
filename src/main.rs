@@ -228,16 +228,48 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
 /// Single pass over a chunk using 64-byte separator bitmasks: split lines on
 /// '\n' and fields on ',', apply the quoting rule, and call `f` for every
 /// well-formed line with exactly N fields.
+///
+/// Per field we record its end offset and its number of quote characters. A
+/// field is valid iff it has no quotes, or exactly two that wrap it.
 #[inline(always)]
 fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&[&[u8]; N])) {
     let n = data.len();
-    let mut out: [&[u8]; N] = [&[]; N];
-    let mut nf = 0usize;
-    let mut fs = 0usize;
-    let mut bad = false;
-    let mut qc = false;
+    let mut ends = [0usize; 8];
+    let mut qn = [0u32; 8];
+    debug_assert!(N < 8);
+    let mut nf = 0usize; // fields seen in the current line
+    let mut ls = 0usize; // line start
+    let mut qcarry = 0u32;
     let mut buf = [0u8; 64];
     let mut base = 0usize;
+
+    #[inline(always)]
+    fn emit<'a, const N: usize>(
+        data: &'a [u8],
+        ls: usize,
+        ends: &[usize; 8],
+        qn: &[u32; 8],
+        f: &mut impl FnMut(&[&'a [u8]; N]),
+    ) {
+        let mut out: [&[u8]; N] = [&[]; N];
+        let mut st = ls;
+        for j in 0..N {
+            let e = ends[j];
+            let fld = &data[st..e];
+            if qn[j] != 0 {
+                let l = fld.len();
+                if qn[j] != 2 || l < 2 || fld[0] != b'"' || fld[l - 1] != b'"' {
+                    return;
+                }
+                out[j] = &fld[1..l - 1];
+            } else {
+                out[j] = fld;
+            }
+            st = e + 1;
+        }
+        f(&out);
+    }
+
     while base < n {
         let (mc, mq, mn) = unsafe {
             if base + 64 <= n {
@@ -255,50 +287,31 @@ fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&[&[u8]; N])) {
             sep &= sep - 1;
             let i = base + k as usize;
             let below = (1u64 << k) - 1;
-            let hasq = qc || (qrem & below) != 0;
+            let idx = nf.min(N);
+            ends[idx] = i;
+            qn[idx] = qcarry + (qrem & below).count_ones();
             qrem &= !below;
-            qc = false;
-            if nf < N {
-                let fld = &data[fs..i];
-                if hasq {
-                    match unq_strict(fld) {
-                        Some(v) => out[nf] = v,
-                        None => bad = true,
-                    }
-                } else {
-                    out[nf] = fld;
-                }
-            }
+            qcarry = 0;
             nf += 1;
-            fs = i + 1;
             if (mn >> k) & 1 == 1 {
-                if !bad && nf == N {
-                    f(&out);
+                if nf == N {
+                    emit::<N>(data, ls, &ends, &qn, &mut f);
                 }
                 nf = 0;
-                bad = false;
+                ls = i + 1;
             }
         }
-        if qrem != 0 {
-            qc = true;
-        }
+        qcarry += qrem.count_ones();
         base += 64;
     }
-    if nf > 0 || fs < n {
-        if nf < N {
-            let fld = &data[fs..n];
-            if qc {
-                match unq_strict(fld) {
-                    Some(v) => out[nf] = v,
-                    None => bad = true,
-                }
-            } else {
-                out[nf] = fld;
-            }
-        }
+    // last line without a trailing newline
+    if ls < n {
+        let idx = nf.min(N);
+        ends[idx] = n;
+        qn[idx] = qcarry;
         nf += 1;
-        if !bad && nf == N {
-            f(&out);
+        if nf == N {
+            emit::<N>(data, ls, &ends, &qn, &mut f);
         }
     }
 }
@@ -371,7 +384,7 @@ fn for_lines(data: &[u8], mut f: impl FnMut(&[u8])) {
 
 // ---------------------------------------------------------------- time
 
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let yoe = year - era * 400;
@@ -402,8 +415,71 @@ fn d2(a: u8, b: u8) -> Option<i64> {
     }
 }
 
-#[inline]
+/// Days since epoch of the first of each month, 1900-01 .. 2300-01 (inclusive).
+const MS_Y0: i64 = 1900;
+const MS_N: usize = 400 * 12 + 1;
+static MS: [i32; MS_N] = {
+    let mut t = [0i32; MS_N];
+    let mut i = 0;
+    while i < MS_N {
+        let y = MS_Y0 + (i / 12) as i64;
+        let m = (i % 12) as i64 + 1;
+        t[i] = days_from_civil(y, m, 1) as i32;
+        i += 1;
+    }
+    t
+};
+
+/// Fast path for `YYYY-MM-DDTHH:MM:SS` (exactly 19 bytes available).
+#[inline(always)]
 fn civil(s: &[u8]) -> Option<i64> {
+    let s: &[u8; 19] = s[..19].try_into().ok()?;
+    let d = |i: usize| s[i].wrapping_sub(b'0') as u32;
+    let bad = (d(0) > 9) | (d(1) > 9) | (d(2) > 9) | (d(3) > 9) | (d(5) > 9) | (d(6) > 9)
+        | (d(8) > 9) | (d(9) > 9) | (d(11) > 9) | (d(12) > 9) | (d(14) > 9) | (d(15) > 9)
+        | (d(17) > 9) | (d(18) > 9)
+        | (s[4] != b'-') | (s[7] != b'-') | (s[10] != b'T') | (s[13] != b':') | (s[16] != b':');
+    if bad {
+        return None;
+    }
+    let year = (d(0) * 1000 + d(1) * 100 + d(2) * 10 + d(3)) as i64;
+    let month = d(5) * 10 + d(6);
+    let day = d(8) * 10 + d(9);
+    let hour = d(11) * 10 + d(12);
+    let minute = d(14) * 10 + d(15);
+    let second = d(17) * 10 + d(18);
+    if (month.wrapping_sub(1) > 11) | (hour > 23) | (minute > 59) | (second > 59) | (day == 0) {
+        return None;
+    }
+    let days = if year >= MS_Y0 && year < MS_Y0 + 400 {
+        let i = ((year - MS_Y0) * 12) as usize + month as usize - 1;
+        let first = MS[i];
+        if day as i32 > MS[i + 1] - first {
+            return None;
+        }
+        first as i64 + day as i64 - 1
+    } else {
+        return civil_slow(year, month as i64, day as i64, hour as i64, minute as i64, second as i64);
+    };
+    Some(days * DAY + (hour * 3_600_000 + minute * 60_000 + second * 1000) as i64)
+}
+
+#[cold]
+fn civil_slow(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> Option<i64> {
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let dim = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => if leap { 29 } else { 28 },
+    };
+    if day > dim {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * DAY + hour * 3_600_000 + minute * 60_000 + second * 1000)
+}
+
+#[allow(dead_code)]
+fn civil_old(s: &[u8]) -> Option<i64> {
     // YYYY-MM-DDTHH:MM:SS
     if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
         return None;
@@ -442,28 +518,32 @@ fn civil(s: &[u8]) -> Option<i64> {
 
 const HUGE: i64 = i64::MAX / 4;
 
-#[inline]
+/// `ingest_ts` is always valid F1 per the rules; parse it without validation
+/// when it has the F1 shape, else fall back to the full parser.
+#[inline(always)]
+fn parse_ingest(s: &[u8]) -> i64 {
+    if s.len() == 20 && s[19] == b'Z' {
+        let d = |i: usize| (s[i].wrapping_sub(b'0')) as i64;
+        let year = d(0) * 1000 + d(1) * 100 + d(2) * 10 + d(3);
+        let month = d(5) * 10 + d(6);
+        if (MS_Y0..MS_Y0 + 400).contains(&year) && (1..=12).contains(&month) {
+            let i = ((year - MS_Y0) * 12 + month - 1) as usize;
+            let day = d(8) * 10 + d(9);
+            let secs = (d(11) * 10 + d(12)) * 3600 + (d(14) * 10 + d(15)) * 60 + d(17) * 10 + d(18);
+            return (MS[i] as i64 + day - 1) * DAY + secs * 1000;
+        }
+    }
+    parse_ts(s).unwrap_or(i64::MAX / 2)
+}
+
+#[inline(always)]
 fn parse_ts(s: &[u8]) -> Option<i64> {
     let n = s.len();
-    if n == 0 {
-        return None;
-    }
-    if s[0].is_ascii_digit() && s.iter().all(|c| c.is_ascii_digit()) {
-        let mut v: i64 = 0;
-        for &c in s {
-            v = v * 10 + (c - b'0') as i64;
-            if v > 1_000_000_000_000_000 {
-                // keep scanning is unnecessary: all digits already checked
-                return Some(HUGE);
-            }
-        }
-        return Some(v);
-    }
     if n == 20 && s[19] == b'Z' {
-        return civil(&s[..19]);
+        return civil(s);
     }
-    if n == 25 && (s[19] == b'+' || s[19] == b'-') && s[22] == b':' {
-        let base = civil(&s[..19])?;
+    if n == 25 && s[22] == b':' && (s[19] == b'+' || s[19] == b'-') {
+        let base = civil(s)?;
         let oh = d2(s[20], s[21])?;
         let om = d2(s[23], s[24])?;
         if oh > 23 || om > 59 {
@@ -472,7 +552,24 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
         let off = (oh * 60 + om) * 60_000;
         return Some(if s[19] == b'+' { base - off } else { base + off });
     }
-    None
+    if n == 0 {
+        return None;
+    }
+    // F3: ASCII digits only, any length; huge values saturate (outside every window)
+    let mut v: i64 = 0;
+    let mut big = false;
+    for &c in s {
+        let d = c.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        if v > 100_000_000_000_000_000 {
+            big = true;
+        } else {
+            v = v * 10 + d as i64;
+        }
+    }
+    Some(if big { HUGE } else { v })
 }
 
 #[inline]
@@ -584,7 +681,7 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx) -> Option<ERaw> {
     if f[0].is_empty() {
         return None;
     }
-    let ingest = parse_ts(f[3]).unwrap_or(i64::MAX / 2);
+    let ingest = parse_ingest(f[3]);
     let mut r = ERaw {
         eid: pack(f[0]),
         user: 0,
@@ -790,6 +887,7 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
 
+    let stop_after: u32 = std::env::var("STOP_AFTER").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let manifest = fs::read_to_string(data.join("manifest.json")).expect("manifest");
     let ws = parse_ts(manifest_value(&manifest, "window_start").as_bytes()).expect("ws");
     let we = parse_ts(manifest_value(&manifest, "window_end").as_bytes()).expect("we");
@@ -945,6 +1043,7 @@ fn main() {
         },
     );
     eprintln!("[{:?}] parsed", t0.elapsed());
+    if stop_after == 1 { std::process::exit(0); }
     (ph.join().unwrap(), astates)
     });
     drop(lstates);
@@ -1065,6 +1164,7 @@ fn main() {
     );
     drop(astates);
     eprintln!("[{:?}] deduped", t0.elapsed());
+    if stop_after == 2 { std::process::exit(0); }
 
     // ---------------- phase C: sessions
     let ndays = (((we - 1).div_euclid(DAY)) - ws.div_euclid(DAY) + 1).max(1) as usize;
@@ -1083,43 +1183,111 @@ fn main() {
             catsum: vec![0; ncat],
             evbuf: Vec::new(),
             ckbuf: Vec::new(),
+            lmap: LocalMap::default(),
+            lid: Vec::new(),
+            estart: Vec::new(),
+            cstart: Vec::new(),
         },
         |st, b| {
+            // Group by person without a full sort: local dense ids via a small
+            // hash table, counting sort by id, then sort each person by time.
             let mut evs = std::mem::take(&mut st.evbuf);
             let mut cks = std::mem::take(&mut st.ckbuf);
-            evs.clear();
-            cks.clear();
+            let mut lm = std::mem::take(&mut st.lmap);
+            let mut lid = std::mem::take(&mut st.lid);
+            let mut start = std::mem::take(&mut st.estart);
+            let mut cstart = std::mem::take(&mut st.cstart);
+            let total_e: usize = bstates.iter().map(|s| s.ev[b].len()).sum();
+            lm.reset((total_e / 8).max(64));
+            lid.clear();
             for s in &bstates {
-                evs.extend_from_slice(&s.ev[b]);
-                cks.extend_from_slice(&s.ck[b]);
+                for e in s.ev[b].iter() {
+                    lid.push(lm.get_or_insert(e.person));
+                }
             }
-            evs.sort_unstable_by_key(|x| (x.person, x.ts));
-            cks.sort_unstable_by_key(|x| (x.person, x.ts, x.cid));
-            let mut ci = 0;
-            let mut i = 0;
-            let n = evs.len();
-            while i < n {
-                let p = evs[i].person;
-                let mut j = i + 1;
-                while j < n && evs[j].person == p {
-                    j += 1;
+            let np = lm.keys.len();
+            start.clear();
+            start.resize(np + 1, 0);
+            for &l in &lid {
+                start[l as usize + 1] += 1;
+            }
+            for i in 0..np {
+                start[i + 1] += start[i];
+            }
+            evs.clear();
+            evs.reserve(total_e);
+            unsafe { evs.set_len(total_e) };
+            {
+                let mut pos: Vec<u32> = start[..np].to_vec();
+                let mut k = 0;
+                for s in &bstates {
+                    for e in s.ev[b].iter() {
+                        let l = lid[k] as usize;
+                        k += 1;
+                        evs[pos[l] as usize] = *e;
+                        pos[l] += 1;
+                    }
                 }
-                while ci < cks.len() && { cks[ci].person } < p {
-                    ci += 1;
+            }
+            // clicks of persons that have events
+            lid.clear();
+            cks.clear();
+            let mut ccount = vec![0u32; np + 1];
+            for s in &bstates {
+                for c in s.ck[b].iter() {
+                    match lm.get(c.person) {
+                        Some(l) => {
+                            lid.push(l);
+                            ccount[l as usize + 1] += 1;
+                        }
+                        None => lid.push(u32::MAX),
+                    }
                 }
-                let cs = ci;
-                while ci < cks.len() && cks[ci].person == p {
-                    ci += 1;
+            }
+            cstart.clear();
+            cstart.extend_from_slice(&ccount);
+            for i in 0..np {
+                cstart[i + 1] += cstart[i];
+            }
+            let total_c = cstart[np] as usize;
+            cks.reserve(total_c);
+            unsafe { cks.set_len(total_c) };
+            {
+                let mut pos: Vec<u32> = cstart[..np].to_vec();
+                let mut k = 0;
+                for s in &bstates {
+                    for c in s.ck[b].iter() {
+                        let l = lid[k];
+                        k += 1;
+                        if l != u32::MAX {
+                            cks[pos[l as usize] as usize] = *c;
+                            pos[l as usize] += 1;
+                        }
+                    }
                 }
-                process_person(p, &evs[i..j], &cks[cs..ci], st.view(), ncamp, ndays, day0, tb);
-                i = j;
+            }
+            for l in 0..np {
+                let es = &mut evs[start[l] as usize..start[l + 1] as usize];
+                if es.len() > 1 {
+                    es.sort_unstable_by_key(|x| x.ts);
+                }
+                let cs = &mut cks[cstart[l] as usize..cstart[l + 1] as usize];
+                if cs.len() > 1 {
+                    cs.sort_unstable_by_key(|x| (x.ts, x.cid));
+                }
+                process_person(lm.keys[l], es, cs, st.view(), ncamp, ndays, day0, tb);
             }
             st.evbuf = evs;
             st.ckbuf = cks;
+            st.lmap = lm;
+            st.lid = lid;
+            st.estart = start;
+            st.cstart = cstart;
         },
     );
     drop(bstates);
     eprintln!("[{:?}] sessionized", t0.elapsed());
+    if stop_after == 3 { std::process::exit(0); }
 
     // ---------------- phase D: write
     let ud = out.join("user_daily");
@@ -1153,6 +1321,8 @@ fn main() {
         );
     });
     eprintln!("[{:?}] done", t0.elapsed());
+    // skip freeing gigabytes of buffers at shutdown
+    std::process::exit(0);
 }
 
 struct StView<'a> {
@@ -1173,6 +1343,79 @@ struct CState {
     catsum: Vec<u64>,
     evbuf: Vec<PEv>,
     ckbuf: Vec<PC>,
+    lmap: LocalMap,
+    lid: Vec<u32>,
+    estart: Vec<u32>,
+    cstart: Vec<u32>,
+}
+
+/// Small growable open-addressing map person key -> dense local id.
+#[derive(Default)]
+struct LocalMap {
+    mask: usize,
+    slots: Vec<(Key, u32)>,
+    keys: Vec<Key>,
+}
+
+impl LocalMap {
+    fn reset(&mut self, hint: usize) {
+        let cap = (hint * 2).next_power_of_two().max(64);
+        self.mask = cap - 1;
+        self.slots.clear();
+        self.slots.resize(cap, (0, u32::MAX));
+        self.keys.clear();
+    }
+    #[inline(always)]
+    fn h(&self, k: Key) -> usize {
+        (mix(k) >> 17) as usize & self.mask
+    }
+    #[inline(always)]
+    fn get_or_insert(&mut self, k: Key) -> u32 {
+        let mut h = self.h(k);
+        loop {
+            let (sk, sv) = self.slots[h];
+            if sv == u32::MAX {
+                let id = self.keys.len() as u32;
+                self.slots[h] = (k, id);
+                self.keys.push(k);
+                if self.keys.len() * 2 > self.slots.len() {
+                    self.grow();
+                }
+                return id;
+            }
+            if sk == k {
+                return sv;
+            }
+            h = (h + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn get(&self, k: Key) -> Option<u32> {
+        let mut h = self.h(k);
+        loop {
+            let (sk, sv) = self.slots[h];
+            if sv == u32::MAX {
+                return None;
+            }
+            if sk == k {
+                return Some(sv);
+            }
+            h = (h + 1) & self.mask;
+        }
+    }
+    fn grow(&mut self) {
+        let cap = self.slots.len() * 2;
+        self.mask = cap - 1;
+        self.slots.clear();
+        self.slots.resize(cap, (0, u32::MAX));
+        for (id, &k) in self.keys.iter().enumerate() {
+            let mut h = (mix(k) >> 17) as usize & self.mask;
+            while self.slots[h].1 != u32::MAX {
+                h = (h + 1) & self.mask;
+            }
+            self.slots[h] = (k, id as u32);
+        }
+    }
 }
 
 impl CState {
