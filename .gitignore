@@ -1,0 +1,5 @@
+target/
+dev/
+out/
+big/
+__pycache__/
