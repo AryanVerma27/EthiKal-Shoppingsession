@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
+use arrow_array::builder::StringBuilder;
 use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use hashbrown::HashMap;
@@ -36,148 +37,87 @@ const CHUNK: usize = 8 << 20;
 
 // ---------------------------------------------------------------- keys
 
-/// IDs are 64-bit keys.
-///
-/// * Compact IDs (1..=10 bytes from `[0-9A-Za-z]`, which covers every ID the
-///   generator writes) are an order-preserving base-63 number: byte-wise order
-///   of the strings equals numeric order of the keys, and the top bit is 0.
-/// * Any other ID is interned: top bit 1 plus an index. Equality stays exact;
-///   ordering goes through `key_cmp`, which compares the real bytes.
+/// Nonzero ASCII IDs of up to nine bytes use seven bits per byte, padded
+/// on the right with zeros. Numeric order matches byte order. Longer IDs
+/// and IDs with other bytes use the interner and have their high bit set.
 type Key = u64;
 const INTERNED: u64 = 1 << 63;
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+const ASCII_BITS: u64 = 0x7F7F_7F7F_7F7F_7F7F;
 
-static RANK: [u8; 256] = {
-    let mut t = [0u8; 256];
-    let mut i = 0;
-    while i < 10 {
-        t[b'0' as usize + i] = 1 + i as u8;
-        i += 1;
-    }
-    let mut i = 0;
-    while i < 26 {
-        t[b'A' as usize + i] = 11 + i as u8;
-        t[b'a' as usize + i] = 37 + i as u8;
-        i += 1;
-    }
-    t
-};
-static UNRANK: [u8; 63] = {
-    let mut t = [0u8; 63];
-    let mut i = 0;
-    while i < 256 {
-        if RANK[i] != 0 {
-            t[RANK[i] as usize] = i as u8;
-        }
-        i += 1;
-    }
-    t
-};
-static POW63: [u64; 11] = {
-    let mut t = [1u64; 11];
-    let mut i = 1;
-    while i < 11 {
-        t[i] = t[i - 1] * 63;
-        i += 1;
-    }
-    t
-};
-
-/// Lane masks keeping the first n bytes.
-static KEEP: [[u8; 16]; 17] = {
-    let mut t = [[0u8; 16]; 17];
-    let mut n = 0;
-    while n <= 16 {
-        let mut j = 0;
-        while j < n {
-            t[n][j] = 0xFF;
-            j += 1;
-        }
-        n += 1;
-    }
-    t
-};
-
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-#[inline(always)]
-unsafe fn compact16(p: *const u8, l: usize) -> Option<Key> {
-    use std::arch::x86_64::*;
-    let v = _mm_loadu_si128(p as *const __m128i);
-    let in_range = |lo: u8, span: u8| {
-        let t = _mm_sub_epi8(v, _mm_set1_epi8(lo as i8));
-        _mm_cmpeq_epi8(_mm_min_epu8(t, _mm_set1_epi8(span as i8)), t)
-    };
-    let dg = in_range(b'0', 9);
-    let up = in_range(b'A', 25);
-    let lo = in_range(b'a', 25);
-    let valid = _mm_or_si128(dg, _mm_or_si128(up, lo));
-    let need = (1u32 << l) - 1;
-    if (_mm_movemask_epi8(valid) as u32) & need != need {
-        return None;
-    }
-    // rank = v - 47 (digit), v - 54 (upper), v - 60 (lower)
-    let off = _mm_or_si128(
-        _mm_and_si128(dg, _mm_set1_epi8(47)),
-        _mm_or_si128(_mm_and_si128(up, _mm_set1_epi8(54)), _mm_and_si128(lo, _mm_set1_epi8(60))),
-    );
-    let r = _mm_and_si128(_mm_sub_epi8(v, off), _mm_loadu_si128(KEEP[l].as_ptr() as *const __m128i));
-    // pairs: r0*63 + r1 ; quads: pair0*3969 + pair1
-    let m1 = _mm_maddubs_epi16(r, _mm_setr_epi8(63, 1, 63, 1, 63, 1, 63, 1, 63, 1, 63, 1, 63, 1, 63, 1));
-    let m2 = _mm_madd_epi16(m1, _mm_setr_epi16(3969, 1, 3969, 1, 3969, 1, 3969, 1));
-    let g0 = _mm_cvtsi128_si32(m2) as u32 as u64; // digits 0..4
-    let g1 = _mm_extract_epi32(m2, 1) as u32 as u64; // digits 4..8
-    let p4 = _mm_extract_epi16(m1, 4) as u32 as u64; // digits 8..10
-    Some(g0 * POW63[6] + g1 * POW63[2] + p4)
-}
-
-/// Compact key, or None when the string needs interning.
 #[inline(always)]
 fn compact(s: &[u8]) -> Option<Key> {
-    let l = s.len();
-    if l > 10 {
+    if s.len() > 9 {
         return None;
     }
-    if l == 0 {
-        // an empty slice may carry a dangling pointer: never load through it
-        return Some(0);
-    }
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    {
-        let p = s.as_ptr();
-        if (p as usize & 4095) <= 4096 - 16 {
-            return unsafe { compact16(p, l) };
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    if let Some(first) = s.get(..8) {
+        let word = u64::from_be_bytes(first.try_into().unwrap());
+        let last = s.get(8).copied().unwrap_or(0);
+        let zeroes = word.wrapping_sub(0x0101_0101_0101_0101) & !word & !ASCII_BITS;
+        if word & !ASCII_BITS != 0 || zeroes != 0 || last >= 128 || (s.len() == 9 && last == 0) {
+            return None;
         }
+        // The mask selects exactly the seven low bits of each byte.
+        let packed = unsafe { std::arch::x86_64::_pext_u64(word, ASCII_BITS) };
+        return Some((packed << 7) | u64::from(last));
     }
-    let mut v = 0u64;
-    let mut bad = 0u8;
-    for &c in s {
-        let r = RANK[c as usize];
-        bad |= (r == 0) as u8;
-        v = v * 63 + r as u64;
+
+    let mut bits = 0;
+    for &byte in s {
+        if byte == 0 || byte >= 128 {
+            return None;
+        }
+        bits = (bits << 7) | u64::from(byte);
     }
-    if bad != 0 {
-        return None;
+    Some(bits << (7 * (9 - s.len())))
+}
+
+fn decode_compact(key: Key) -> ([u8; 9], usize) {
+    let mut bytes = [0; 9];
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    {
+        let first = unsafe { std::arch::x86_64::_pdep_u64(key >> 7, ASCII_BITS) };
+        bytes[..8].copy_from_slice(&first.to_be_bytes());
+        bytes[8] = (key & 127) as u8;
     }
-    Some(v * POW63[10 - l])
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = ((key >> (7 * (8 - i))) & 127) as u8;
+    }
+    let len = 9 - key.trailing_zeros() as usize / 7;
+    (bytes, len)
 }
 
 struct Interned {
-    map: std::collections::HashMap<Vec<u8>, u64>,
-    strs: Vec<Vec<u8>>,
+    map: HashMap<Arc<[u8]>, Key>,
+    strs: Vec<Arc<[u8]>>,
 }
-static INTERN: OnceLock<Mutex<Interned>> = OnceLock::new();
-fn intern_table() -> &'static Mutex<Interned> {
-    INTERN.get_or_init(|| Mutex::new(Interned { map: Default::default(), strs: Vec::new() }))
+const INTERN_SHARDS: usize = 256;
+static INTERN: OnceLock<[Mutex<Interned>; INTERN_SHARDS]> = OnceLock::new();
+static ID_HASH: OnceLock<hashbrown::DefaultHashBuilder> = OnceLock::new();
+
+fn id_hash(s: &[u8]) -> u64 {
+    ID_HASH.get_or_init(Default::default).hash_one(s)
+}
+
+fn intern_table(shard: usize) -> &'static Mutex<Interned> {
+    &INTERN.get_or_init(|| std::array::from_fn(|_| {
+        Mutex::new(Interned { map: HashMap::new(), strs: Vec::new() })
+    }))[shard]
 }
 
 #[cold]
 fn intern(s: &[u8]) -> Key {
-    let mut t = intern_table().lock().unwrap();
+    let shard = id_hash(s) as usize & (INTERN_SHARDS - 1);
+    let mut t = intern_table(shard).lock().unwrap();
     if let Some(&k) = t.map.get(s) {
         return k;
     }
-    let k = INTERNED | t.strs.len() as u64;
-    t.strs.push(s.to_vec());
-    t.map.insert(s.to_vec(), k);
+    let k = INTERNED | (t.strs.len() as u64 * INTERN_SHARDS as u64) | shard as u64;
+    let s: Arc<[u8]> = s.into();
+    t.strs.push(s.clone());
+    t.map.insert(s, k);
     k
 }
 
@@ -191,22 +131,54 @@ fn pack(s: &[u8]) -> Key {
 
 fn unpack(k: Key) -> Vec<u8> {
     if k & INTERNED != 0 {
-        return intern_table().lock().unwrap().strs[(k & !INTERNED) as usize].clone();
+        let index = (k & !INTERNED) as usize;
+        let shard = index & (INTERN_SHARDS - 1);
+        return intern_table(shard).lock().unwrap().strs[index / INTERN_SHARDS].to_vec();
     }
-    let mut out = Vec::with_capacity(10);
-    let mut v = k;
-    let mut digits = [0u8; 10];
-    for i in (0..10).rev() {
-        digits[i] = (v % 63) as u8;
-        v /= 63;
-    }
-    for d in digits {
-        if d == 0 {
-            break;
+    let (bytes, len) = decode_compact(k);
+    bytes[..len].to_vec()
+}
+
+/// Event IDs only need equality within deduplication. Long IDs are kept in each
+/// parser's byte arena, so the parse hot path has no shared map or lock for them.
+/// The upper bits of their handle select a bucket and the lower bits find the
+/// original bytes. Deduplication compares those bytes on a hash match.
+#[derive(Default)]
+struct EventIds {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl EventIds {
+    #[inline]
+    fn encode(&mut self, id: &[u8]) -> Key {
+        if let Some(key) = compact(id) {
+            return key;
         }
-        out.push(UNRANK[d as usize]);
+        let index = u32::try_from(self.ends.len()).expect("too many long event IDs in one worker");
+        self.bytes.extend_from_slice(id);
+        self.ends.push(self.bytes.len());
+        INTERNED | (id_hash(id) << 32) | u64::from(index)
     }
-    out
+
+    fn bytes(&self, key: Key) -> &[u8] {
+        let index = key as u32 as usize;
+        let start = if index == 0 { 0 } else { self.ends[index - 1] };
+        &self.bytes[start..self.ends[index]]
+    }
+
+    fn same_id(&self, key: Key, other: &Self, other_key: Key) -> bool {
+        if key & INTERNED == 0 {
+            key == other_key
+        } else {
+            key >> 32 == other_key >> 32 && self.bytes(key) == other.bytes(other_key)
+        }
+    }
+}
+
+#[inline(always)]
+fn event_hash(key: Key) -> u64 {
+    mix(if key & INTERNED == 0 { key } else { key & 0xFFFF_FFFF_0000_0000 })
 }
 
 /// Byte-wise order of the IDs behind two keys.
@@ -782,16 +754,25 @@ struct CRaw {
 #[repr(C, packed(8))]
 struct PEv {
     person: Key,
+    event: Event,
+}
+
+#[derive(Clone, Copy)]
+struct Event {
     ts: u32,
     price: u32,
     cat: u16,
-    purchase: bool,
 }
 
 #[derive(Clone, Copy)]
 #[repr(C, packed(8))]
 struct PC {
     person: Key,
+    click: Click,
+}
+
+#[derive(Clone, Copy)]
+struct Click {
     cid: Key,
     ts: u32,
     camp: u32,
@@ -835,13 +816,13 @@ impl Ctx {
 }
 
 #[inline]
-fn parse_event(f: &[&[u8]; 7], ctx: &Ctx) -> Option<ERaw> {
+fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, ids: &mut EventIds) -> Option<ERaw> {
     if f[0].is_empty() {
         return None;
     }
     let ingest = parse_ingest(f[3]);
     let mut r = ERaw {
-        eid: pack(f[0]),
+        eid: ids.encode(f[0]),
         user: 0,
         ingest: ((ingest - ctx.ws).div_euclid(1000)).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
         ts: 0,
@@ -1151,6 +1132,7 @@ fn main() {
     // ---------------- phase A: parse
     struct AState {
         ev: Vec<Vec<ERaw>>,
+        event_ids: EventIds,
         ck: Vec<CRaw>,
         lk: Vec<(Key, Key)>,
         buf: Vec<u8>,
@@ -1185,6 +1167,7 @@ fn main() {
         nthreads,
         || AState {
             ev: (0..NB).map(|_| Vec::with_capacity(ev_cap)).collect(),
+            event_ids: EventIds::default(),
             ck: Vec::with_capacity(ck_cap),
             lk: Vec::new(),
             buf: Vec::new(),
@@ -1197,8 +1180,8 @@ fn main() {
             let bytes = &buf[lo..hi];
             match c.kind {
                 Kind::Ev => scan::<7>(bytes, |f| {
-                    if let Some(r) = parse_event(f, &ctx) {
-                        st.ev[bucket_of(r.eid)].push(r);
+                    if let Some(r) = parse_event(f, &ctx, &mut st.event_ids) {
+                        st.ev[event_hash(r.eid) as usize & (NB - 1)].push(r);
                     }
                 }),
                 Kind::Ck => scan::<4>(bytes, |f| {
@@ -1245,9 +1228,7 @@ fn main() {
                 batched(&persons, astates[t].ck.iter().copied(), |c| c.user, |c, p| {
                     ck[bucket_of(p)].push(PC {
                         person: p,
-                        cid: c.cid,
-                        ts: c.ts,
-                        camp: c.camp,
+                        click: Click { cid: c.cid, ts: c.ts, camp: c.camp },
                     });
                 });
                 return;
@@ -1282,7 +1263,7 @@ fn main() {
                 let v = &a.ev[b];
                 for (ri, r) in v.iter().enumerate() {
                     let eid = r.eid;
-                    let hm = mix(eid);
+                    let hm = event_hash(eid);
                     let fp = hm >> 32;
                     let me = (fp << 32) | ((ti as u64) << 26) | ri as u64;
                     let mut h = (hm >> 12) as usize & mask;
@@ -1295,7 +1276,8 @@ fn main() {
                         if e >> 32 == fp {
                             let o = at(e);
                             let oe = o.eid;
-                            if oe == eid {
+                            let other_ids = &astates[(e as u32 >> 26) as usize].event_ids;
+                            if a.event_ids.same_id(eid, other_ids, oe) {
                                 let (oi, ni) = (o.ingest, r.ingest);
                                 if ni < oi {
                                     kill(e, dead);
@@ -1327,10 +1309,7 @@ fn main() {
             batched(&persons, survivors, |r| r.user, |r, p| {
                 evb[bucket_of(p)].push(PEv {
                     person: p,
-                    ts: r.ts,
-                    price: r.price,
-                    cat: r.cat,
-                    purchase: r.kind == 3,
+                    event: Event { ts: r.ts, price: r.price, cat: r.cat },
                 });
             });
         },
@@ -1389,19 +1368,21 @@ fn main() {
             }
             evs.clear();
             evs.reserve(total_e);
-            unsafe { evs.set_len(total_e) };
             {
+                let spare = evs.spare_capacity_mut();
                 let mut pos: Vec<u32> = start[..np].to_vec();
                 let mut k = 0;
                 for s in &bstates {
                     for e in s.ev[b].iter() {
                         let l = lid[k] as usize;
                         k += 1;
-                        evs[pos[l] as usize] = *e;
+                        spare[pos[l] as usize].write(e.event);
                         pos[l] += 1;
                     }
                 }
             }
+            // Counts and prefix sums assign each event a unique slot.
+            unsafe { evs.set_len(total_e) };
             // clicks of persons that have events
             lid.clear();
             cks.clear();
@@ -1424,8 +1405,8 @@ fn main() {
             }
             let total_c = cstart[np] as usize;
             cks.reserve(total_c);
-            unsafe { cks.set_len(total_c) };
             {
+                let spare = cks.spare_capacity_mut();
                 let mut pos: Vec<u32> = cstart[..np].to_vec();
                 let mut k = 0;
                 for s in &bstates {
@@ -1433,12 +1414,14 @@ fn main() {
                         let l = lid[k];
                         k += 1;
                         if l != u32::MAX {
-                            cks[pos[l as usize] as usize] = *c;
+                            spare[pos[l as usize] as usize].write(c.click);
                             pos[l as usize] += 1;
                         }
                     }
                 }
             }
+            // Every counted click was written once above.
+            unsafe { cks.set_len(total_c) };
             for l in 0..np {
                 let es = &mut evs[start[l] as usize..start[l + 1] as usize];
                 if es.len() > 1 {
@@ -1448,7 +1431,8 @@ fn main() {
                 if cs.len() > 1 {
                     cs.sort_unstable_by(|a, b| {
                         let (at, bt, ac, bc) = (a.ts, b.ts, a.cid, b.cid);
-                        at.cmp(&bt).then_with(|| key_cmp(ac, bc))
+                        // The last qualifying click wins, including on ties.
+                        at.cmp(&bt).then_with(|| key_cmp(bc, ac))
                     });
                 }
                 process_person(lm.keys[l], es, cs, st.view(), ncamp, ndays, day0, tb);
@@ -1517,8 +1501,8 @@ struct CState {
     pos: Vec<u32>,
     active: Vec<u32>,
     catsum: Vec<u64>,
-    evbuf: Vec<PEv>,
-    ckbuf: Vec<PC>,
+    evbuf: Vec<Event>,
+    ckbuf: Vec<Click>,
     lmap: LocalMap,
     lid: Vec<u32>,
     estart: Vec<u32>,
@@ -1609,8 +1593,8 @@ impl CState {
 
 fn process_person(
     person: Key,
-    evs: &[PEv],
-    cks: &[PC],
+    evs: &[Event],
+    cks: &[Click],
     st: StView<'_>,
     ncamp: usize,
     ndays: usize,
@@ -1672,14 +1656,12 @@ fn process_person(
         let mut last = s;
         let mut m = k;
         let mut srev = 0u64;
-        let mut has_p = false;
         while m < n && evs[m].ts as i64 - last <= GAP {
             let e = evs[m];
             last = e.ts as i64;
-            if e.purchase {
+            if e.price != 0 {
                 srev += e.price as u64;
                 catsum[e.cat as usize] += e.price as u64;
-                has_p = true;
             }
             m += 1;
         }
@@ -1710,12 +1692,7 @@ fn process_person(
             lo += 1;
         }
         let credited = if hi > lo {
-            let t = cks[hi - 1].ts;
-            let mut q = hi - 1;
-            while q > lo && { cks[q - 1].ts } == t {
-                q -= 1;
-            }
-            cks[q].camp as usize
+            cks[hi - 1].camp as usize
         } else {
             organic
         };
@@ -1723,7 +1700,7 @@ fn process_person(
         debug_assert!(di < ndays);
         let row = &mut stats[credited * ndays + di];
         row[0] += 1;
-        row[1] += has_p as u64;
+        row[1] += (srev != 0) as u64;
         row[2] += srev;
         for &c in active.iter() {
             stats[c as usize * ndays + di][3] += 1;
@@ -1899,7 +1876,17 @@ fn write_users(path: &Path, rows: &[UserRow], cats: &[Vec<u8>]) {
     let mut w = ArrowWriter::try_new(file, schema.clone(), Some(props())).unwrap();
     let cat_s: Vec<String> = cats.iter().map(|c| to_string(c.clone())).collect();
     for part in rows.chunks(1 << 20).chain(if rows.is_empty() { Some(&rows[..]) } else { None }) {
-        let uid: StringArray = part.iter().map(|r| Some(to_string(unpack(r.person)))).collect();
+        let mut user_ids = StringBuilder::with_capacity(part.len(), part.len() * 12);
+        for row in part {
+            if row.person & INTERNED == 0 {
+                let (bytes, len) = decode_compact(row.person);
+                // Compact IDs contain only ASCII bytes.
+                user_ids.append_value(unsafe { std::str::from_utf8_unchecked(&bytes[..len]) });
+            } else {
+                user_ids.append_value(to_string(unpack(row.person)));
+            }
+        }
+        let uid = user_ids.finish();
         let day: Date32Array = part.iter().map(|r| Some(r.day)).collect();
         let ses: Int64Array = part.iter().map(|r| Some(r.sessions as i64)).collect();
         let ev: Int64Array = part.iter().map(|r| Some(r.events as i64)).collect();
@@ -1981,6 +1968,20 @@ fn write_campaigns(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_ids_compare_original_bytes_across_workers() {
+        let mut left = EventIds::default();
+        let mut right = EventIds::default();
+        let first = left.encode(b"long-event-id-one");
+        let other = right.encode(b"long-event-id-two");
+        let duplicate = right.encode(b"long-event-id-one");
+
+        assert_eq!(event_hash(first), event_hash(duplicate));
+        assert!(left.same_id(first, &right, duplicate));
+        let collision = (first & 0xFFFF_FFFF_0000_0000) | u64::from(other as u32);
+        assert!(!left.same_id(first, &right, collision));
+    }
 
     /// Straightforward scalar reading of the timestamp rules.
     fn ts_ref(s: &[u8]) -> Option<i64> {
