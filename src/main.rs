@@ -501,20 +501,26 @@ fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&[&[u8]; N])) {
     ) {
         let mut out: [&[u8]; N] = [&[]; N];
         let mut st = ls;
+        let mut bad = false;
         for j in 0..N {
             let e = ends[j];
-            // SAFETY: ls <= ends[0] < ends[1] < ... <= data.len() by construction
-            let fld = unsafe { data.get_unchecked(st..e) };
-            if qn[j] != 0 {
-                let l = fld.len();
-                if qn[j] != 2 || l < 2 || fld[0] != b'"' || fld[l - 1] != b'"' {
-                    return;
-                }
-                out[j] = unsafe { fld.get_unchecked(1..l - 1) };
-            } else {
-                out[j] = fld;
+            let q = qn[j];
+            // Quoted fields come at random, so avoid branching on them: the
+            // two probes are clamped in range and only count when q == 2.
+            // SAFETY: ls <= ends[0] < ends[1] < ... <= data.len(), data not
+            // empty; a field with two quotes has at least two bytes.
+            unsafe {
+                let first = *data.get_unchecked(st.min(data.len() - 1));
+                let last = *data.get_unchecked(e.max(1) - 1);
+                let wrapped = (q == 2) & (first == b'"') & (last == b'"');
+                bad |= (q != 0) & !wrapped;
+                let w = wrapped as usize;
+                out[j] = data.get_unchecked(st + w..e - w);
             }
             st = e + 1;
+        }
+        if bad {
+            return;
         }
         f(&out);
     }
@@ -1097,8 +1103,9 @@ impl Pool {
 
 /// Append-only record list stored in pool blocks.
 struct Part<T> {
+    cur: *mut T,
+    end: *mut T,
     blocks: Vec<*mut T>,
-    used: usize, // records in the last block
 }
 // Parts are written by one thread, then only read; a bucket's blocks are
 // recycled by the single task that consumed that bucket.
@@ -1108,23 +1115,40 @@ unsafe impl<T: Sync> Sync for Part<T> {}
 impl<T: Copy> Part<T> {
     const PER: usize = BLK / std::mem::size_of::<T>();
     fn new() -> Self {
-        Part { blocks: Vec::new(), used: Self::PER }
+        Part { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new() }
     }
     #[inline(always)]
     fn push(&mut self, v: T, pool: &mut Pool) {
-        if self.used == Self::PER {
-            self.blocks.push(pool.get() as *mut T);
-            self.used = 0;
+        if self.cur == self.end {
+            self.refill(pool);
         }
-        // SAFETY: the last block exists and has room for PER records
-        unsafe { (*self.blocks.last().unwrap_unchecked()).add(self.used).write(v) };
-        self.used += 1;
+        // SAFETY: cur < end, inside the last block
+        unsafe {
+            self.cur.write(v);
+            self.cur = self.cur.add(1);
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn refill(&mut self, pool: &mut Pool) {
+        let b = pool.get() as *mut T;
+        self.blocks.push(b);
+        self.cur = b;
+        self.end = unsafe { b.add(Self::PER) };
+    }
+    /// Records in the last block.
+    fn used(&self) -> usize {
+        if self.blocks.is_empty() {
+            0
+        } else {
+            Self::PER - unsafe { self.end.offset_from(self.cur) } as usize
+        }
     }
     fn len(&self) -> usize {
         if self.blocks.is_empty() {
             0
         } else {
-            (self.blocks.len() - 1) * Self::PER + self.used
+            (self.blocks.len() - 1) * Self::PER + self.used()
         }
     }
     #[inline(always)]
@@ -1135,8 +1159,9 @@ impl<T: Copy> Part<T> {
     #[inline]
     fn slices(&self) -> impl Iterator<Item = &[T]> {
         let last = self.blocks.len().wrapping_sub(1);
+        let used = self.used();
         self.blocks.iter().enumerate().map(move |(i, &b)| {
-            let n = if i == last { self.used } else { Self::PER };
+            let n = if i == last { used } else { Self::PER };
             unsafe { std::slice::from_raw_parts(b as *const T, n) }
         })
     }
@@ -1600,6 +1625,9 @@ fn main() {
     let day0 = ws.div_euclid(DAY);
     let ncat = cats.len();
     let tb = ws - WEEK;
+    // biggest buckets first, so whales do not become end-of-phase stragglers
+    let mut order: Vec<usize> = (0..NB).collect();
+    order.sort_by_key(|&b| std::cmp::Reverse(bstates.iter().map(|s| s.ev[b].len()).sum::<usize>()));
     let cstates = par_tasks(
         NB,
         nthreads,
@@ -1617,7 +1645,8 @@ fn main() {
             estart: Vec::new(),
             cstart: Vec::new(),
         },
-        |st, b| {
+        |st, t| {
+            let b = order[t];
             // Group by person without a full sort: local dense ids via a small
             // hash table, counting sort by id, then sort each person by time.
             let mut evs = std::mem::take(&mut st.evbuf);
