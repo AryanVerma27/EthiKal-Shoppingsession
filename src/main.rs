@@ -366,7 +366,7 @@ fn mix(k: u64) -> u64 {
 
 #[inline]
 fn bucket_of(k: Key) -> usize {
-    (mix(k) & (NB as u64 - 1)) as usize
+    (mix(k) >> (64 - BBITS)) as usize
 }
 
 #[derive(Default, Clone, Copy)]
@@ -900,18 +900,33 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 // ---------------------------------------------------------------- records
 
 // Times inside records are u32 milliseconds since `tb = window_start - 7 days`.
-#[derive(Clone, Copy)]
-#[repr(C, packed(8))]
+
+/// Parsed event copy: what dedup needs, and the packed payload if it is valid.
 struct ERaw {
     eid: Key,
+    ing: i32, // ingest seconds relative to window_start, 24 bits << 8 | extra eid hash bits
     user: Key,
-    ingest: i32, // seconds relative to window_start, clamped; only orders copies
-    ts: u32,
-    price: u32,
-    cat: u16,
-    kind: u8, // 0 invalid, 1 view, 2 cart, 3 purchase
-    ex: u8,   // extra hash bits of a long event_id
+    w: u64, // payload word, or DEAD when the copy is invalid
 }
+
+/// Dedup record of one event copy.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DRec {
+    eid: Key,
+    ing: i32,
+    pay: u32, // payload slot: thread << 26 | slot; NO_PAY when invalid
+}
+const NO_PAY: u32 = u32::MAX;
+
+/// Event payload: w = ts << 32 | price << 8 | category (price 0 = no purchase).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Pay {
+    key: Key, // user id, then person
+    w: u64,
+}
+const DEAD: u64 = u64::MAX; // no valid ts reaches 2^32 - 1
 
 #[derive(Clone, Copy)]
 #[repr(C, packed(8))]
@@ -920,16 +935,6 @@ struct CRaw {
     user: Key,
     ts: u32,
     camp: u32,
-}
-
-#[derive(Clone, Copy)]
-#[repr(C, packed(8))]
-struct PEv {
-    person: Key,
-    ts: u32,
-    price: u32,
-    cat: u16,
-    purchase: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -987,16 +992,9 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, names: &mut LongNames) -> Option<ERaw>
     }
     let ingest = parse_ingest(f[3]);
     let (eid, ex) = id_key(f[0]);
-    let mut r = ERaw {
-        eid,
-        ex,
-        user: 0,
-        ingest: ((ingest - ctx.ws).div_euclid(1000)).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-        ts: 0,
-        price: 0,
-        cat: 0,
-        kind: 0,
-    };
+    // 24 bits of seconds cover +-97 days around the window start
+    let sec = (ingest - ctx.ws).div_euclid(1000).clamp(-(1 << 23), (1 << 23) - 1) as i32;
+    let mut r = ERaw { eid, ing: sec << 8 | ex as i32, user: 0, w: DEAD };
     if f[1].is_empty() || f[5].is_empty() {
         return Some(r);
     }
@@ -1019,21 +1017,19 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, names: &mut LongNames) -> Option<ERaw>
         Some(t) if t >= ctx.ws && t < ctx.we => t,
         _ => return Some(r),
     };
+    let mut price = 0u64;
     if kind == 3 {
         match parse_price(f[6]) {
-            Some(p) => r.price = p,
+            Some(p) => price = p as u64,
             None => return Some(r),
         }
     }
     if ingest.saturating_sub(ts) > DAY {
         return Some(r);
     }
-    if kind == 3 {
-        r.cat = ctx.cat(f[5]);
-    }
+    let cat = if kind == 3 { ctx.cat(f[5]) as u64 } else { 0 };
     r.user = user_key(f[1], names);
-    r.ts = (ts - ctx.tb) as u32;
-    r.kind = kind;
+    r.w = ((ts - ctx.tb) as u64) << 32 | price << 8 | cat;
     Some(r)
 }
 
@@ -1170,6 +1166,37 @@ impl<T: Copy> Part<T> {
         self.slices().flat_map(|s| s.iter())
     }
 }
+
+/// Payload list whose slots have stable 32-bit addresses. `table` is the
+/// owning thread's block directory: slot id = block number << 8 | index.
+struct PayPart {
+    part: Part<Pay>,
+    next: u32,
+}
+
+impl PayPart {
+    fn new() -> Self {
+        PayPart { part: Part::new(), next: 0 }
+    }
+    #[inline(always)]
+    fn push(&mut self, v: Pay, pool: &mut Pool, table: &mut Vec<*mut Pay>) -> u32 {
+        if self.part.cur == self.part.end {
+            self.part.refill(pool);
+            assert!(table.len() < 1 << 18);
+            self.next = (table.len() as u32) << 8;
+            table.push(self.part.cur);
+        }
+        unsafe {
+            self.part.cur.write(v);
+            self.part.cur = self.part.cur.add(1);
+        }
+        let id = self.next;
+        self.next += 1;
+        id
+    }
+}
+const _: () = assert!(BLK / std::mem::size_of::<Pay>() == 256);
+const _: () = assert!(std::mem::size_of::<DRec>() == 16);
 
 // ---------------------------------------------------------------- parallel helper
 
@@ -1332,6 +1359,7 @@ fn main() {
     cats.push(b"unknown".to_vec());
     cats.sort();
     cats.dedup();
+    assert!(cats.len() <= 256, "too many categories");
     let cat_idx: std::collections::HashMap<Vec<u8>, u16> =
         cats.iter().enumerate().map(|(i, c)| (c.clone(), i as u16)).collect();
     let unknown_cat = cat_idx[&b"unknown"[..]];
@@ -1379,17 +1407,12 @@ fn main() {
     let chunk_bytes: usize = std::env::var("CHUNK_KB").ok().and_then(|v| v.parse::<usize>().ok()).map(|k| k << 10).unwrap_or(CHUNK);
     let mut files: Vec<(fs::File, u64)> = Vec::new();
     let mut chunks: Vec<Chunk> = Vec::new();
-    let mut ck_bytes = 0usize;
     for (sub, kind) in [("links", Kind::Lk), ("events", Kind::Ev), ("clicks", Kind::Ck)] {
         for p in list_csv(&data.join(sub)) {
             let Ok(f) = fs::File::open(&p) else { continue };
             let flen = f.metadata().map(|m| m.len()).unwrap_or(0);
             if flen == 0 {
                 continue;
-            }
-            match kind {
-                Kind::Ck => ck_bytes += flen as usize,
-                Kind::Ev | Kind::Lk => {}
             }
             let fi = files.len();
             let mut st = 0u64;
@@ -1401,14 +1424,17 @@ fn main() {
             files.push((f, flen));
         }
     }
-    let ck_cap = ck_bytes / 40 / nthreads * 5 / 4 + 16;
     eprintln!("[{:?}] {} chunks", t0.elapsed(), chunks.len());
 
     // ---------------- phase A: parse
+    unsafe impl Send for AState {}
+    unsafe impl Sync for AState {}
     struct AState {
-        ev: Vec<Part<ERaw>>,
+        dd: Vec<Part<DRec>>,  // by event id
+        pay: Vec<PayPart>,    // by user id
+        ptab: Vec<*mut Pay>,
         pool: Pool,
-        ck: Vec<CRaw>,
+        ck: Vec<Part<CRaw>>,  // by user id
         buf: Vec<u8>,
         tid: usize,
         names: LongNames,
@@ -1436,7 +1462,7 @@ fn main() {
             });
         },
     );
-    let (persons, astates) = std::thread::scope(|sc| {
+    let (astates, bstates) = std::thread::scope(|sc| {
     let ph = sc.spawn(|| {
         let names = Names { parts: lstates.iter().map(|s| &s.2).collect() };
         let p = build_persons(&lstates.iter().map(|s| &s.0[..]).collect::<Vec<_>>(), &names);
@@ -1447,9 +1473,11 @@ fn main() {
         chunks.len() - nlk,
         nthreads,
         || AState {
-            ev: (0..NB).map(|_| Part::new()).collect(),
+            dd: (0..NB).map(|_| Part::new()).collect(),
+            pay: (0..NB).map(|_| PayPart::new()).collect(),
+            ptab: Vec::new(),
             pool: Pool::new(),
-            ck: Vec::with_capacity(ck_cap),
+            ck: (0..NB).map(|_| Part::new()).collect(),
             buf: Vec::new(),
             tid: next_tid.fetch_add(1, Ordering::Relaxed),
             names: LongNames::default(),
@@ -1463,18 +1491,23 @@ fn main() {
             let bytes = &buf[lo..hi];
             match c.kind {
                 Kind::Ev => {
-                    let (ev, names, pool) = (&mut st.ev, &mut st.names, &mut st.pool);
+                    let (dd, pay, ptab, names, pool) = (&mut st.dd, &mut st.pay, &mut st.ptab, &mut st.names, &mut st.pool);
+                    let tid = (st.tid as u32) << 26;
                     scan::<7>(bytes, |f| {
                         if let Some(r) = parse_event(f, &ctx, names) {
-                            ev[bucket_of(r.eid)].push(r, pool);
+                            let mut id = NO_PAY;
+                            if r.w != DEAD {
+                                id = tid | pay[bucket_of(r.user)].push(Pay { key: r.user, w: r.w }, pool, ptab);
+                            }
+                            dd[bucket_of(r.eid)].push(DRec { eid: r.eid, ing: r.ing, pay: id }, pool);
                         }
                     })
                 }
                 Kind::Ck => {
-                    let (ck, names, arena, tid) = (&mut st.ck, &mut st.names, &mut st.arena, st.tid);
+                    let (ck, names, arena, tid, pool) = (&mut st.ck, &mut st.names, &mut st.arena, st.tid, &mut st.pool);
                     scan::<4>(bytes, |f| {
                         if let Some(r) = parse_click(f, &ctx, tid, names, arena) {
-                            ck.push(r);
+                            ck[bucket_of(r.user)].push(r, pool);
                         }
                     })
                 }
@@ -1485,140 +1518,147 @@ fn main() {
     );
     eprintln!("[{:?}] parsed", t0.elapsed());
     if stop_after == 1 { std::process::exit(0); }
-    (ph.join().unwrap(), astates)
-    });
-    let lnames: Vec<LongNames> = lstates.into_iter().map(|s| s.2).collect();
 
-    // ---------------- phase B: dedup events, bucket by person
+    // ---------------- phase B: dedup on event_id, 16-byte records only.
+    // A bitmap finds the few ids seen more than once; only those are sorted.
+    // Losing copies get their payload marked dead in place.
+    let mut ptabs: Vec<&[*mut Pay]> = vec![&[]; astates.len()];
+    for a in &astates {
+        ptabs[a.tid] = &a.ptab;
+    }
+    struct SharedTabs<'a>(Vec<&'a [*mut Pay]>);
+    unsafe impl Sync for SharedTabs<'_> {}
+    let ptabs = SharedTabs(ptabs);
+    struct DState {
+        seen: Vec<u64>,
+        susp: Vec<u64>,
+        cand: Vec<DRec>,
+        free: Vec<*mut u8>,
+    }
+    unsafe impl Send for DState {}
+    let dstates = par_tasks(
+        NB,
+        nthreads,
+        || DState { seen: Vec::new(), susp: Vec::new(), cand: Vec::new(), free: Vec::new() },
+        |st, b| {
+            let ptabs = &ptabs;
+            let total: usize = astates.iter().map(|a| a.dd[b].len()).sum();
+            let nbits = (total * 16).next_power_of_two().max(1 << 10);
+            let bit = |eid: Key| {
+                let h = mix(eid) as usize & (nbits - 1);
+                (h >> 6, 1u64 << (h & 63))
+            };
+            st.seen.clear();
+            st.seen.resize(nbits / 64, 0);
+            st.susp.clear();
+            st.susp.resize(nbits / 64, 0);
+            for a in &astates {
+                for sl in a.dd[b].slices() {
+                    for r in sl {
+                        let (i, m) = bit(r.eid);
+                        let old = st.seen[i];
+                        st.susp[i] |= old & m;
+                        st.seen[i] = old | m;
+                    }
+                }
+            }
+            st.cand.clear();
+            for a in &astates {
+                for sl in a.dd[b].slices() {
+                    for r in sl {
+                        let (i, m) = bit(r.eid);
+                        if st.susp[i] & m != 0 {
+                            st.cand.push(*r);
+                        }
+                    }
+                }
+            }
+            st.cand.sort_unstable_by_key(|r| (r.eid, r.ing & 0xFF, r.ing >> 8));
+            for k in 1..st.cand.len() {
+                let (p, r) = (st.cand[k - 1], st.cand[k]);
+                if p.eid == r.eid && (p.ing ^ r.ing) & 0xFF == 0 && r.pay != NO_PAY {
+                    // SAFETY: every payload slot belongs to exactly one copy,
+                    // and a copy is handled by one task
+                    unsafe {
+                        let blk = ptabs.0[(r.pay >> 26) as usize][((r.pay >> 8) & 0x3_FFFF) as usize];
+                        (*blk.add((r.pay & 0xFF) as usize)).w = DEAD;
+                    }
+                }
+            }
+            for a in &astates {
+                st.free.extend(a.dd[b].blocks.iter().map(|&p| p as *mut u8));
+            }
+        },
+    );
+    eprintln!("[{:?}] deduped", t0.elapsed());
+    let persons = ph.join().unwrap();
+
+    // ---------------- phase P: resolve persons, bucket by bucket, so table
+    // lookups stay in cache; rows whose person lives in another bucket move.
     struct BState {
-        ev: Vec<Part<PEv>>,
+        ev: Vec<Part<Pay>>,
         ck: Vec<Part<PC>>,
         pool: Pool,
-        buf: Vec<u64>,
-        dead: Vec<u64>,
     }
-    let nck_tasks = astates.len();
+    unsafe impl Send for BState {}
+    unsafe impl Sync for BState {}
+    let spare = std::sync::Mutex::new(dstates.into_iter().map(|d| Pool { free: d.free, ..Pool::new() }).collect::<Vec<Pool>>());
     let bstates = par_tasks(
-        NB + nck_tasks,
+        NB,
         nthreads,
         || BState {
             ev: (0..NB).map(|_| Part::new()).collect(),
             ck: (0..NB).map(|_| Part::new()).collect(),
-            pool: Pool::new(),
-            buf: Vec::new(),
-            dead: Vec::new(),
+            pool: spare.lock().unwrap().pop().unwrap_or_else(Pool::new),
         },
-        |st, t| {
-            if t < nck_tasks {
-                let (ck, pool) = (&mut st.ck, &mut st.pool);
-                batched(&persons, astates[t].ck.iter().copied(), |c| c.user, |c, p| {
-                    ck[bucket_of(p)].push(PC {
-                        person: p,
-                        cid: c.cid,
-                        ts: c.ts,
-                        camp: c.camp,
-                    }, pool);
-                });
-                return;
-            }
-            let b = t - nck_tasks;
-            // open-addressing table over (thread, index) refs; keep min ingest per eid
-            let total: usize = astates.iter().map(|a| a.ev[b].len()).sum();
-            let cap = (total * 2).next_power_of_two().max(16);
-            let mask = cap - 1;
-            let table = &mut st.buf;
-            table.clear();
-            table.resize(cap, u64::MAX);
-            // entry = fingerprint(32) | thread(6) | index(26); u64::MAX = empty
-            let at = |e: u64| -> &ERaw {
-                let r = e as u32;
-                astates[(r >> 26) as usize].ev[b].at((r & 0x3FF_FFFF) as usize)
-            };
-            // dead[i] marks records that lost dedup; i = offs[ti] + ri
-            let mut offs = [0usize; 65];
-            for (ti, a) in astates.iter().enumerate() {
-                offs[ti + 1] = offs[ti] + a.ev[b].len();
-            }
-            let dead = &mut st.dead;
-            dead.clear();
-            dead.resize(total / 64 + 1, 0);
-            let kill = |e: u64, dead: &mut Vec<u64>| {
-                let r = e as u32;
-                let i = offs[(r >> 26) as usize] + (r & 0x3FF_FFFF) as usize;
-                dead[i >> 6] |= 1u64 << (i & 63);
-            };
-            for (ti, a) in astates.iter().enumerate() {
-                let v = &a.ev[b];
-                for (ri, r) in v.iter().enumerate() {
-                    let eid = r.eid;
-                    let hm = mix(eid);
-                    let fp = hm >> 32;
-                    let me = (fp << 32) | ((ti as u64) << 26) | ri as u64;
-                    let mut h = (hm >> 12) as usize & mask;
-                    loop {
-                        let e = table[h];
-                        if e == u64::MAX {
-                            table[h] = me;
-                            break;
-                        }
-                        if e >> 32 == fp {
-                            let o = at(e);
-                            let oe = o.eid;
-                            if oe == eid && o.ex == r.ex {
-                                let (oi, ni) = (o.ingest, r.ingest);
-                                if ni < oi {
-                                    kill(e, dead);
-                                    table[h] = me;
-                                } else {
-                                    kill(me, dead);
-                                }
-                                break;
-                            }
-                        }
-                        h = (h + 1) & mask;
-                    }
-                }
-            }
-            let (evb, pool) = (&mut st.ev, &mut st.pool);
-            let dead = &st.dead;
-            let survivors = astates
-                .iter()
-                .enumerate()
-                .flat_map(|(ti, a)| {
-                    let o = offs[ti];
-                    a.ev[b].iter().enumerate().filter(move |(ri, _)| {
-                        let i = o + ri;
-                        dead[i >> 6] >> (i & 63) & 1 == 0
-                    })
-                })
-                .map(|(_, r)| *r)
-                .filter(|r| r.kind != 0);
-            batched(&persons, survivors, |r| r.user, |r, p| {
-                evb[bucket_of(p)].push(PEv {
-                    person: p,
-                    ts: r.ts,
-                    price: r.price,
-                    cat: r.cat,
-                    purchase: r.kind == 3,
-                }, pool);
-            });
-            // this bucket is consumed: its blocks feed this thread's next writes
+        |st, b| {
+            let (ev, ck, pool) = (&mut st.ev, &mut st.ck, &mut st.pool);
             for a in &astates {
-                st.pool.free.extend(a.ev[b].blocks.iter().map(|&p| p as *mut u8));
+                let part = &a.pay[b].part;
+                for (bi, sl) in part.slices().enumerate() {
+                    let base = part.blocks[bi];
+                    batched(
+                        &persons,
+                        sl.iter().enumerate().filter(|(_, r)| r.w != DEAD).map(|(i, r)| (i, *r)),
+                        |x| x.1.key,
+                        |(i, r), p| {
+                            if p == r.key {
+                                return;
+                            }
+                            // SAFETY: only this task touches bucket b
+                            unsafe {
+                                if bucket_of(p) == b {
+                                    (*base.add(i)).key = p;
+                                } else {
+                                    (*base.add(i)).w = DEAD;
+                                    ev[bucket_of(p)].push(Pay { key: p, w: r.w }, pool);
+                                }
+                            }
+                        },
+                    );
+                }
+                batched(&persons, a.ck[b].iter().copied(), |c| c.user, |c, p| {
+                    ck[bucket_of(p)].push(PC { person: p, cid: c.cid, ts: c.ts, camp: c.camp }, pool);
+                });
             }
         },
     );
+    eprintln!("[{:?}] persons resolved", t0.elapsed());
+    if stop_after == 2 { std::process::exit(0); }
+    (astates, bstates)
+    });
+    let lnames: Vec<LongNames> = lstates.into_iter().map(|s| s.2).collect();
+    let mut pays: Vec<Vec<PayPart>> = Vec::new();
     // keep only the id text; arenas are indexed by the tid inside click keys
     let mut anames = Vec::new();
     let mut arenas: Vec<Vec<u8>> = vec![Vec::new(); astates.len()];
     for a in astates {
         arenas[a.tid] = a.arena;
         anames.push(a.names);
-        std::mem::forget((a.ev, a.ck, a.buf));
+        pays.push(a.pay);
+        std::mem::forget((a.dd, a.ck, a.buf));
     }
     let names = Names { parts: lnames.iter().chain(anames.iter()).collect() };
-    eprintln!("[{:?}] deduped", t0.elapsed());
-    if stop_after == 2 { std::process::exit(0); }
 
     // ---------------- phase C: sessions
     let ndays = (((we - 1).div_euclid(DAY)) - ws.div_euclid(DAY) + 1).max(1) as usize;
@@ -1627,7 +1667,7 @@ fn main() {
     let tb = ws - WEEK;
     // biggest buckets first, so whales do not become end-of-phase stragglers
     let mut order: Vec<usize> = (0..NB).collect();
-    order.sort_by_key(|&b| std::cmp::Reverse(bstates.iter().map(|s| s.ev[b].len()).sum::<usize>()));
+    order.sort_by_key(|&b| std::cmp::Reverse(pays.iter().map(|a| a[b].part.len()).sum::<usize>() + bstates.iter().map(|s| s.ev[b].len()).sum::<usize>()));
     let cstates = par_tasks(
         NB,
         nthreads,
@@ -1639,6 +1679,7 @@ fn main() {
             active: Vec::new(),
             catsum: vec![0; ncat],
             evbuf: Vec::new(),
+            wbuf: Vec::new(),
             ckbuf: Vec::new(),
             lmap: LocalMap::default(),
             lid: Vec::new(),
@@ -1655,14 +1696,27 @@ fn main() {
             let mut lid = std::mem::take(&mut st.lid);
             let mut start = std::mem::take(&mut st.estart);
             let mut cstart = std::mem::take(&mut st.cstart);
-            let total_e: usize = bstates.iter().map(|s| s.ev[b].len()).sum();
-            lm.reset((total_e / 8).max(64));
+            // payloads that stayed in this bucket, then those that moved in
+            let cap: usize = pays.iter().map(|a| a[b].part.len()).sum::<usize>()
+                + bstates.iter().map(|s| s.ev[b].len()).sum::<usize>();
+            lm.reset((cap / 8).max(64));
             lid.clear();
-            for s in &bstates {
-                for e in s.ev[b].iter() {
-                    lid.push(lm.get_or_insert(e.person));
+            let mut ws_buf = std::mem::take(&mut st.wbuf);
+            ws_buf.clear();
+            let slices = || {
+                pays.iter()
+                    .flat_map(|a| a[b].part.slices())
+                    .chain(bstates.iter().flat_map(|s| s.ev[b].slices()))
+            };
+            for sl in slices() {
+                for e in sl {
+                    if e.w != DEAD {
+                        lid.push(lm.get_or_insert(e.key));
+                        ws_buf.push(e.w);
+                    }
                 }
             }
+            let total_e = ws_buf.len();
             let np = lm.keys.len();
             start.clear();
             start.resize(np + 1, 0);
@@ -1673,20 +1727,16 @@ fn main() {
                 start[i + 1] += start[i];
             }
             evs.clear();
-            evs.reserve(total_e);
-            unsafe { evs.set_len(total_e) };
+            evs.resize(total_e, 0);
             {
                 let mut pos: Vec<u32> = start[..np].to_vec();
-                let mut k = 0;
-                for s in &bstates {
-                    for e in s.ev[b].iter() {
-                        let l = lid[k] as usize;
-                        k += 1;
-                        evs[pos[l] as usize] = *e;
-                        pos[l] += 1;
-                    }
+                for (&w, &l) in ws_buf.iter().zip(lid.iter()) {
+                    let q = &mut pos[l as usize];
+                    evs[*q as usize] = w;
+                    *q += 1;
                 }
             }
+            st.wbuf = ws_buf;
             // clicks of persons that have events
             lid.clear();
             cks.clear();
@@ -1727,7 +1777,7 @@ fn main() {
             for l in 0..np {
                 let es = &mut evs[start[l] as usize..start[l + 1] as usize];
                 if es.len() > 1 {
-                    es.sort_unstable_by_key(|x| x.ts);
+                    es.sort_unstable(); // timestamp is the top half
                 }
                 let cs = &mut cks[cstart[l] as usize..cstart[l + 1] as usize];
                 if cs.len() > 1 {
@@ -1803,7 +1853,8 @@ struct CState {
     pos: Vec<u32>,
     active: Vec<u32>,
     catsum: Vec<u64>,
-    evbuf: Vec<PEv>,
+    evbuf: Vec<u64>,
+    wbuf: Vec<u64>,
     ckbuf: Vec<PC>,
     lmap: LocalMap,
     lid: Vec<u32>,
@@ -1895,7 +1946,7 @@ impl CState {
 
 fn process_person(
     person: Key,
-    evs: &[PEv],
+    evs: &[u64], // sorted payload words
     cks: &[PC],
     st: StView<'_>,
     ncamp: usize,
@@ -1946,7 +1997,7 @@ fn process_person(
     let n = evs.len();
     let mut k = 0;
     while k < n {
-        let s = evs[k].ts as i64;
+        let s = (evs[k] >> 32) as i64;
         let d = (s + tb).div_euclid(DAY);
         if d != cur_day {
             flush(rows, catsum, cur_day, g_sessions, g_events, g_rev);
@@ -1959,12 +2010,13 @@ fn process_person(
         let mut m = k;
         let mut srev = 0u64;
         let mut has_p = false;
-        while m < n && evs[m].ts as i64 - last <= GAP {
-            let e = evs[m];
-            last = e.ts as i64;
-            if e.purchase {
-                srev += e.price as u64;
-                catsum[e.cat as usize] += e.price as u64;
+        while m < n && (evs[m] >> 32) as i64 - last <= GAP {
+            let w = evs[m];
+            last = (w >> 32) as i64;
+            let price = (w >> 8) & 0xFF_FFFF;
+            if price != 0 {
+                srev += price;
+                catsum[(w & 0xFF) as usize] += price;
                 has_p = true;
             }
             m += 1;
@@ -2027,17 +2079,18 @@ fn process_person(
 /// (0 is the empty string, never a linked id). Supports prefetching.
 struct PTable {
     mask: usize,
+    shift: u32,
     slots: Vec<[Key; 2]>,
 }
 
 impl PTable {
     fn new(n: usize) -> Self {
         let cap = (n * 2).next_power_of_two().max(16);
-        PTable { mask: cap - 1, slots: vec![[0, 0]; cap] }
+        PTable { mask: cap - 1, shift: 64 - cap.trailing_zeros(), slots: vec![[0, 0]; cap] }
     }
     #[inline(always)]
     fn slot(&self, k: Key) -> usize {
-        (mix(k) >> 11) as usize & self.mask
+        (mix(k) >> self.shift) as usize
     }
     fn insert(&mut self, k: Key, v: Key) {
         let mut h = self.slot(k);
