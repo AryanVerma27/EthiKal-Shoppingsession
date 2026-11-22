@@ -1056,6 +1056,12 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, tid: usize, names: &mut LongNames, are
 const BLK: usize = 4096;
 const SLAB: usize = 8 << 20;
 
+/// Huge pages for slabs: off with HUGE=0.
+fn use_huge() -> bool {
+    static H: OnceLock<bool> = OnceLock::new();
+    *H.get_or_init(|| std::env::var("HUGE").map_or(true, |v| v != "0"))
+}
+
 /// Per-thread supply of 4 KiB blocks cut from huge-page slabs. Blocks whose
 /// records are finished are recycled, so later phases reuse touched memory.
 /// Slabs live until the process exits.
@@ -1085,7 +1091,9 @@ impl Pool {
                 extern "C" {
                     fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
                 }
-                madvise(p as *mut _, SLAB, 14); // MADV_HUGEPAGE, best effort
+                if use_huge() {
+                    madvise(p as *mut _, SLAB, 14); // MADV_HUGEPAGE, best effort
+                }
             }
             self.cur = p;
             self.left = SLAB / BLK;

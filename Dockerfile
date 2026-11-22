@@ -10,6 +10,6 @@ RUN cargo build --release && cp target/release/sessions /sessions
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /sessions /app/sessions
-ENV MIMALLOC_ALLOW_LARGE_OS_PAGES=1 MIMALLOC_PURGE_DELAY=-1
+ENV HUGE=0 MIMALLOC_ALLOW_LARGE_OS_PAGES=0 MIMALLOC_PURGE_DELAY=-1
 WORKDIR /app
 CMD ["/app/sessions"]
