@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use arrow_array::builder::StringBuilder;
-use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, Date32Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use hashbrown::HashMap;
 use memchr::memchr;
@@ -26,14 +26,14 @@ use memchr::memchr;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
 const WEEK: i64 = 7 * DAY;
 const BBITS: u32 = 9;
 const NB: usize = 1 << BBITS;
-const CHUNK: usize = 8 << 20;
+const CHUNK: usize = 1 << 20; // best of 256K/1M/8M on cold reads, ties when warm
 
 // ---------------------------------------------------------------- keys
 
@@ -1049,6 +1049,103 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, tid: usize, names: &mut LongNames, are
     })
 }
 
+// ---------------------------------------------------------------- block pool
+
+const BLK: usize = 4096;
+const SLAB: usize = 8 << 20;
+
+/// Per-thread supply of 4 KiB blocks cut from huge-page slabs. Blocks whose
+/// records are finished are recycled, so later phases reuse touched memory.
+/// Slabs live until the process exits.
+struct Pool {
+    free: Vec<*mut u8>,
+    cur: *mut u8,
+    left: usize,
+}
+unsafe impl Send for Pool {}
+unsafe impl Sync for Pool {} // no method takes &self
+
+impl Pool {
+    fn new() -> Self {
+        Pool { free: Vec::new(), cur: std::ptr::null_mut(), left: 0 }
+    }
+    #[inline(never)]
+    fn get(&mut self) -> *mut u8 {
+        if let Some(p) = self.free.pop() {
+            return p;
+        }
+        if self.left == 0 {
+            let layout = std::alloc::Layout::from_size_align(SLAB, 2 << 20).unwrap();
+            let p = unsafe { std::alloc::alloc(layout) };
+            assert!(!p.is_null());
+            #[cfg(target_os = "linux")]
+            unsafe {
+                extern "C" {
+                    fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+                }
+                madvise(p as *mut _, SLAB, 14); // MADV_HUGEPAGE, best effort
+            }
+            self.cur = p;
+            self.left = SLAB / BLK;
+        }
+        let p = self.cur;
+        self.left -= 1;
+        self.cur = unsafe { p.add(BLK) };
+        p
+    }
+}
+
+/// Append-only record list stored in pool blocks.
+struct Part<T> {
+    blocks: Vec<*mut T>,
+    used: usize, // records in the last block
+}
+// Parts are written by one thread, then only read; a bucket's blocks are
+// recycled by the single task that consumed that bucket.
+unsafe impl<T: Send> Send for Part<T> {}
+unsafe impl<T: Sync> Sync for Part<T> {}
+
+impl<T: Copy> Part<T> {
+    const PER: usize = BLK / std::mem::size_of::<T>();
+    fn new() -> Self {
+        Part { blocks: Vec::new(), used: Self::PER }
+    }
+    #[inline(always)]
+    fn push(&mut self, v: T, pool: &mut Pool) {
+        if self.used == Self::PER {
+            self.blocks.push(pool.get() as *mut T);
+            self.used = 0;
+        }
+        // SAFETY: the last block exists and has room for PER records
+        unsafe { (*self.blocks.last().unwrap_unchecked()).add(self.used).write(v) };
+        self.used += 1;
+    }
+    fn len(&self) -> usize {
+        if self.blocks.is_empty() {
+            0
+        } else {
+            (self.blocks.len() - 1) * Self::PER + self.used
+        }
+    }
+    #[inline(always)]
+    fn at(&self, i: usize) -> &T {
+        debug_assert!(i < self.len());
+        unsafe { &*self.blocks[i / Self::PER].add(i % Self::PER) }
+    }
+    #[inline]
+    fn slices(&self) -> impl Iterator<Item = &[T]> {
+        let last = self.blocks.len().wrapping_sub(1);
+        self.blocks.iter().enumerate().map(move |(i, &b)| {
+            let n = if i == last { self.used } else { Self::PER };
+            unsafe { std::slice::from_raw_parts(b as *const T, n) }
+        })
+    }
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.slices().flat_map(|s| s.iter())
+    }
+}
+
 // ---------------------------------------------------------------- parallel helper
 
 fn par_tasks<S: Send>(
@@ -1109,7 +1206,7 @@ struct Chunk {
     end: u64,
 }
 
-const EXTRA: usize = 1 << 16;
+const EXTRA: usize = 1 << 12;
 
 fn read_at(f: &fs::File, buf: &mut [u8], off: u64) -> usize {
     use std::os::unix::fs::FileExt;
@@ -1254,9 +1351,10 @@ fn main() {
     };
 
     // open input files and cut them into regions
+    let chunk_bytes: usize = std::env::var("CHUNK_KB").ok().and_then(|v| v.parse::<usize>().ok()).map(|k| k << 10).unwrap_or(CHUNK);
     let mut files: Vec<(fs::File, u64)> = Vec::new();
     let mut chunks: Vec<Chunk> = Vec::new();
-    let (mut ev_bytes, mut ck_bytes) = (0usize, 0usize);
+    let mut ck_bytes = 0usize;
     for (sub, kind) in [("links", Kind::Lk), ("events", Kind::Ev), ("clicks", Kind::Ck)] {
         for p in list_csv(&data.join(sub)) {
             let Ok(f) = fs::File::open(&p) else { continue };
@@ -1265,27 +1363,26 @@ fn main() {
                 continue;
             }
             match kind {
-                Kind::Ev => ev_bytes += flen as usize,
                 Kind::Ck => ck_bytes += flen as usize,
-                Kind::Lk => {}
+                Kind::Ev | Kind::Lk => {}
             }
             let fi = files.len();
             let mut st = 0u64;
             while st < flen {
-                let en = (st + CHUNK as u64).min(flen);
+                let en = (st + chunk_bytes as u64).min(flen);
                 chunks.push(Chunk { kind, file: fi, start: st, end: en });
                 st = en;
             }
             files.push((f, flen));
         }
     }
-    let ev_cap = ev_bytes / 60 / nthreads / NB * 5 / 4 + 16;
     let ck_cap = ck_bytes / 40 / nthreads * 5 / 4 + 16;
     eprintln!("[{:?}] {} chunks", t0.elapsed(), chunks.len());
 
     // ---------------- phase A: parse
     struct AState {
-        ev: Vec<Vec<ERaw>>,
+        ev: Vec<Part<ERaw>>,
+        pool: Pool,
         ck: Vec<CRaw>,
         buf: Vec<u8>,
         tid: usize,
@@ -1325,7 +1422,8 @@ fn main() {
         chunks.len() - nlk,
         nthreads,
         || AState {
-            ev: (0..NB).map(|_| Vec::with_capacity(ev_cap)).collect(),
+            ev: (0..NB).map(|_| Part::new()).collect(),
+            pool: Pool::new(),
             ck: Vec::with_capacity(ck_cap),
             buf: Vec::new(),
             tid: next_tid.fetch_add(1, Ordering::Relaxed),
@@ -1340,10 +1438,10 @@ fn main() {
             let bytes = &buf[lo..hi];
             match c.kind {
                 Kind::Ev => {
-                    let (ev, names) = (&mut st.ev, &mut st.names);
+                    let (ev, names, pool) = (&mut st.ev, &mut st.names, &mut st.pool);
                     scan::<7>(bytes, |f| {
                         if let Some(r) = parse_event(f, &ctx, names) {
-                            ev[bucket_of(r.eid)].push(r);
+                            ev[bucket_of(r.eid)].push(r, pool);
                         }
                     })
                 }
@@ -1368,8 +1466,9 @@ fn main() {
 
     // ---------------- phase B: dedup events, bucket by person
     struct BState {
-        ev: Vec<Vec<PEv>>,
-        ck: Vec<Vec<PC>>,
+        ev: Vec<Part<PEv>>,
+        ck: Vec<Part<PC>>,
+        pool: Pool,
         buf: Vec<u64>,
         dead: Vec<u64>,
     }
@@ -1378,21 +1477,22 @@ fn main() {
         NB + nck_tasks,
         nthreads,
         || BState {
-            ev: (0..NB).map(|_| Vec::with_capacity(ev_cap)).collect(),
-            ck: (0..NB).map(|_| Vec::with_capacity(ck_cap / NB + 16)).collect(),
+            ev: (0..NB).map(|_| Part::new()).collect(),
+            ck: (0..NB).map(|_| Part::new()).collect(),
+            pool: Pool::new(),
             buf: Vec::new(),
             dead: Vec::new(),
         },
         |st, t| {
             if t < nck_tasks {
-                let ck = &mut st.ck;
+                let (ck, pool) = (&mut st.ck, &mut st.pool);
                 batched(&persons, astates[t].ck.iter().copied(), |c| c.user, |c, p| {
                     ck[bucket_of(p)].push(PC {
                         person: p,
                         cid: c.cid,
                         ts: c.ts,
                         camp: c.camp,
-                    });
+                    }, pool);
                 });
                 return;
             }
@@ -1407,7 +1507,7 @@ fn main() {
             // entry = fingerprint(32) | thread(6) | index(26); u64::MAX = empty
             let at = |e: u64| -> &ERaw {
                 let r = e as u32;
-                &astates[(r >> 26) as usize].ev[b][(r & 0x3FF_FFFF) as usize]
+                astates[(r >> 26) as usize].ev[b].at((r & 0x3FF_FFFF) as usize)
             };
             // dead[i] marks records that lost dedup; i = offs[ti] + ri
             let mut offs = [0usize; 65];
@@ -1454,7 +1554,7 @@ fn main() {
                     }
                 }
             }
-            let evb = &mut st.ev;
+            let (evb, pool) = (&mut st.ev, &mut st.pool);
             let dead = &st.dead;
             let survivors = astates
                 .iter()
@@ -1475,8 +1575,12 @@ fn main() {
                     price: r.price,
                     cat: r.cat,
                     purchase: r.kind == 3,
-                });
+                }, pool);
             });
+            // this bucket is consumed: its blocks feed this thread's next writes
+            for a in &astates {
+                st.pool.free.extend(a.ev[b].blocks.iter().map(|&p| p as *mut u8));
+            }
         },
     );
     // keep only the id text; arenas are indexed by the tid inside click keys
@@ -1485,6 +1589,7 @@ fn main() {
     for a in astates {
         arenas[a.tid] = a.arena;
         anames.push(a.names);
+        std::mem::forget((a.ev, a.ck, a.buf));
     }
     let names = Names { parts: lnames.iter().chain(anames.iter()).collect() };
     eprintln!("[{:?}] deduped", t0.elapsed());
@@ -1612,7 +1717,7 @@ fn main() {
             st.cstart = cstart;
         },
     );
-    drop(bstates);
+    std::mem::forget(bstates);
     eprintln!("[{:?}] sessionized", t0.elapsed());
     if stop_after == 3 { std::process::exit(0); }
 
@@ -2030,6 +2135,7 @@ fn props() -> WriterProperties {
     WriterProperties::builder()
         .set_compression(Compression::UNCOMPRESSED)
         .set_dictionary_enabled(false)
+        .set_statistics_enabled(EnabledStatistics::None)
         .set_max_row_group_size(1 << 20)
         .build()
 }
@@ -2042,8 +2148,8 @@ fn write_users(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], names: &Names) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
         Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("events", DataType::Int64, false),
+        Field::new("sessions", DataType::Int32, false),
+        Field::new("events", DataType::Int32, false),
         Field::new("revenue_cents", DataType::Int64, false),
         Field::new("top_category", DataType::Utf8, true),
     ]));
@@ -2062,10 +2168,10 @@ fn write_users(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], names: &Names) {
             ub.append_value(&last.as_ref().unwrap().1);
         }
         let uid: StringArray = ub.finish();
-        let day: Date32Array = part.iter().map(|r| Some(r.day)).collect();
-        let ses: Int64Array = part.iter().map(|r| Some(r.sessions as i64)).collect();
-        let ev: Int64Array = part.iter().map(|r| Some(r.events as i64)).collect();
-        let rev: Int64Array = part.iter().map(|r| Some(r.revenue as i64)).collect();
+        let day = Date32Array::from_iter_values(part.iter().map(|r| r.day));
+        let ses = Int32Array::from_iter_values(part.iter().map(|r| r.sessions as i32));
+        let ev = Int32Array::from_iter_values(part.iter().map(|r| r.events as i32));
+        let rev = Int64Array::from_iter_values(part.iter().map(|r| r.revenue as i64));
         let top: StringArray = part
             .iter()
             .map(|r| if r.top == u16::MAX { None } else { Some(cat_s[r.top as usize].as_str()) })
