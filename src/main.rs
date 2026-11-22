@@ -13,9 +13,10 @@ use std::fs;
 use std::hash::{BuildHasher, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+use arrow_array::builder::StringBuilder;
 use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use hashbrown::HashMap;
@@ -36,15 +37,16 @@ const CHUNK: usize = 8 << 20;
 
 // ---------------------------------------------------------------- keys
 
-/// IDs are 64-bit keys.
+/// IDs are opaque byte strings, handled as 64-bit keys.
 ///
-/// * Compact IDs (1..=10 bytes from `[0-9A-Za-z]`, which covers every ID the
-///   generator writes) are an order-preserving base-63 number: byte-wise order
-///   of the strings equals numeric order of the keys, and the top bit is 0.
-/// * Any other ID is interned: top bit 1 plus an index. Equality stays exact;
-///   ordering goes through `key_cmp`, which compares the real bytes.
+/// * Compact IDs (1..=10 bytes from `[0-9A-Za-z]`) are an order-preserving
+///   base-63 number: byte-wise order equals numeric order, top bit 0, exact.
+/// * Any other ID has the top bit set. User IDs (and event IDs, which carry 8
+///   more hash bits) use a 63-bit hash; the text of long user IDs is kept in
+///   per-thread `LongNames` tables. Click IDs are only ever ordered, so they
+///   point at their text in a per-thread arena. Nothing takes a lock.
 type Key = u64;
-const INTERNED: u64 = 1 << 63;
+const LONG_ID: u64 = 1 << 63;
 
 static RANK: [u8; 256] = {
     let mut t = [0u8; 256];
@@ -160,63 +162,198 @@ fn compact(s: &[u8]) -> Option<Key> {
     Some(v * POW63[10 - l])
 }
 
-struct Interned {
-    map: std::collections::HashMap<Vec<u8>, u64>,
-    strs: Vec<Vec<u8>>,
-}
-static INTERN: OnceLock<Mutex<Interned>> = OnceLock::new();
-fn intern_table() -> &'static Mutex<Interned> {
-    INTERN.get_or_init(|| Mutex::new(Interned { map: Default::default(), strs: Vec::new() }))
+#[inline(always)]
+fn mum(a: u64, b: u64) -> u64 {
+    let r = (a as u128) * (b as u128);
+    (r as u64) ^ ((r >> 64) as u64)
 }
 
-#[cold]
-fn intern(s: &[u8]) -> Key {
-    let mut t = intern_table().lock().unwrap();
-    if let Some(&k) = t.map.get(s) {
-        return k;
+/// 128 bits of hash of an arbitrary byte string (two independently seeded
+/// multiply-fold lanes over 16-byte blocks, with an overlapping tail block).
+#[inline]
+fn hash128(s: &[u8]) -> (u64, u64) {
+    const P: [u64; 4] = [0xa076_1d64_78bd_642f, 0xe703_7ed1_a0b4_28db, 0x8ebc_6af0_9c88_c6e3, 0x5899_65cc_7537_4cc3];
+    let l = s.len() as u64;
+    let (mut h1, mut h2) = (P[0] ^ l, P[3] ^ l.wrapping_mul(P[1]));
+    let mut block = |b: &[u8]| {
+        let w0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        h1 = mum(w0 ^ P[1], w1 ^ h1);
+        h2 = mum(w1 ^ P[2], w0 ^ h2.rotate_left(29));
+    };
+    if s.len() < 16 {
+        let mut t = [0u8; 16];
+        t[..s.len()].copy_from_slice(s);
+        block(&t);
+    } else {
+        let mut i = 0;
+        while i + 16 <= s.len() {
+            block(&s[i..i + 16]);
+            i += 16;
+        }
+        if i < s.len() {
+            block(&s[s.len() - 16..]);
+        }
     }
-    let k = INTERNED | t.strs.len() as u64;
-    t.strs.push(s.to_vec());
-    t.map.insert(s.to_vec(), k);
-    k
+    (mum(h1 ^ P[2], P[1] ^ l), mum(h2 ^ P[0], P[3] ^ l))
+}
+
+#[inline(never)]
+fn long_key(s: &[u8]) -> (Key, u8) {
+    let (h1, h2) = hash128(s);
+    (LONG_ID | (h1 >> 1), h2 as u8)
+}
+
+/// Key plus extra hash bits (0 for exact compact keys).
+#[inline(always)]
+fn id_key(s: &[u8]) -> (Key, u8) {
+    match compact(s) {
+        Some(k) => (k, 0),
+        None => long_key(s),
+    }
+}
+
+/// key -> text of the long user IDs one thread has seen.
+#[derive(Default)]
+struct LongNames {
+    slots: Vec<(Key, u64)>, // (key, offset << 24 | len); key 0 = empty
+    n: usize,
+    arena: Vec<u8>,
+}
+
+impl LongNames {
+    #[inline(never)]
+    fn add(&mut self, k: Key, s: &[u8]) {
+        if (self.n + 1) * 2 > self.slots.len() {
+            let cap = (self.slots.len() * 2).max(1 << 12);
+            let old = std::mem::replace(&mut self.slots, vec![(0, 0); cap]);
+            for e in old {
+                if e.0 != 0 {
+                    let mut h = mix(e.0) as usize & (cap - 1);
+                    while self.slots[h].0 != 0 {
+                        h = (h + 1) & (cap - 1);
+                    }
+                    self.slots[h] = e;
+                }
+            }
+        }
+        let mask = self.slots.len() - 1;
+        let mut h = mix(k) as usize & mask;
+        loop {
+            let e = self.slots[h].0;
+            if e == k {
+                return;
+            }
+            if e == 0 {
+                break;
+            }
+            h = (h + 1) & mask;
+        }
+        assert!(s.len() < 1 << 24);
+        self.slots[h] = (k, (self.arena.len() as u64) << 24 | s.len() as u64);
+        self.arena.extend_from_slice(s);
+        self.n += 1;
+    }
+    fn get(&self, k: Key) -> Option<&[u8]> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let mut h = mix(k) as usize & mask;
+        loop {
+            let (e, v) = self.slots[h];
+            if e == k {
+                let o = (v >> 24) as usize;
+                return Some(&self.arena[o..o + (v & 0xFF_FFFF) as usize]);
+            }
+            if e == 0 {
+                return None;
+            }
+            h = (h + 1) & mask;
+        }
+    }
 }
 
 #[inline(always)]
-fn pack(s: &[u8]) -> Key {
+fn user_key(s: &[u8], names: &mut LongNames) -> Key {
     match compact(s) {
         Some(k) => k,
-        None => intern(s),
-    }
-}
-
-fn unpack(k: Key) -> Vec<u8> {
-    if k & INTERNED != 0 {
-        return intern_table().lock().unwrap().strs[(k & !INTERNED) as usize].clone();
-    }
-    let mut out = Vec::with_capacity(10);
-    let mut v = k;
-    let mut digits = [0u8; 10];
-    for i in (0..10).rev() {
-        digits[i] = (v % 63) as u8;
-        v /= 63;
-    }
-    for d in digits {
-        if d == 0 {
-            break;
+        None => {
+            let k = long_key(s).0;
+            names.add(k, s);
+            k
         }
-        out.push(UNRANK[d as usize]);
     }
-    out
 }
 
-/// Byte-wise order of the IDs behind two keys.
-#[inline]
-fn key_cmp(a: Key, b: Key) -> std::cmp::Ordering {
-    if (a | b) & INTERNED == 0 {
-        a.cmp(&b)
-    } else {
-        unpack(a).cmp(&unpack(b))
+fn decode_compact(k: Key, buf: &mut [u8; 10]) -> &[u8] {
+    let mut v = k;
+    let mut n = 10;
+    for i in (0..10).rev() {
+        let d = (v % 63) as usize;
+        v /= 63;
+        buf[i] = UNRANK[d];
+        if d == 0 {
+            n = i;
+        }
     }
+    &buf[..n]
+}
+
+/// Text behind user keys, across all threads' tables.
+struct Names<'a> {
+    parts: Vec<&'a LongNames>,
+}
+
+impl<'a> Names<'a> {
+    fn bytes<'b>(&'b self, k: Key, buf: &'b mut [u8; 10]) -> &'b [u8] {
+        if k & LONG_ID == 0 {
+            return decode_compact(k, buf);
+        }
+        self.parts.iter().find_map(|p| p.get(k)).expect("long id text")
+    }
+    /// Byte-wise order of the IDs behind two user keys.
+    fn cmp(&self, a: Key, b: Key) -> std::cmp::Ordering {
+        if (a | b) & LONG_ID == 0 {
+            return a.cmp(&b);
+        }
+        let (mut x, mut y) = ([0u8; 10], [0u8; 10]);
+        self.bytes(a, &mut x).cmp(self.bytes(b, &mut y))
+    }
+}
+
+/// Click ID key: compact, or LONG_ID | thread << 40 | offset of (u32 len, text).
+#[inline(always)]
+fn click_key(s: &[u8], tid: usize, arena: &mut Vec<u8>) -> Key {
+    match compact(s) {
+        Some(k) => k,
+        None => {
+            let off = arena.len() as u64;
+            assert!(off < 1 << 40);
+            arena.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            arena.extend_from_slice(s);
+            LONG_ID | (tid as u64) << 40 | off
+        }
+    }
+}
+
+/// Byte-wise order of two click IDs.
+#[inline]
+fn click_cmp(a: Key, b: Key, arenas: &[Vec<u8>]) -> std::cmp::Ordering {
+    if (a | b) & LONG_ID == 0 {
+        return a.cmp(&b);
+    }
+    fn get<'b>(k: Key, arenas: &'b [Vec<u8>], buf: &'b mut [u8; 10]) -> &'b [u8] {
+        if k & LONG_ID == 0 {
+            return decode_compact(k, buf);
+        }
+        let ar = &arenas[((k & !LONG_ID) >> 40) as usize];
+        let o = (k & ((1 << 40) - 1)) as usize;
+        let l = u32::from_le_bytes(ar[o..o + 4].try_into().unwrap()) as usize;
+        &ar[o + 4..o + 4 + l]
+    }
+    let (mut x, mut y) = ([0u8; 10], [0u8; 10]);
+    get(a, arenas, &mut x).cmp(get(b, arenas, &mut y))
 }
 
 #[inline(always)]
@@ -767,6 +904,7 @@ struct ERaw {
     price: u32,
     cat: u16,
     kind: u8, // 0 invalid, 1 view, 2 cart, 3 purchase
+    ex: u8,   // extra hash bits of a long event_id
 }
 
 #[derive(Clone, Copy)]
@@ -814,7 +952,7 @@ struct Ctx {
     products_long: std::collections::HashMap<Vec<u8>, u16>,
     unknown_cat: u16,
     camps: KMap<u32>,
-    camps_long: std::collections::HashMap<Vec<u8>, u32>,
+    camp_ids: Vec<Vec<u8>>,
 }
 
 impl Ctx {
@@ -827,21 +965,25 @@ impl Ctx {
     }
     #[inline]
     fn camp(&self, c: &[u8]) -> Option<u32> {
-        match compact(c) {
-            Some(k) => self.camps.get(&k).copied(),
-            None => self.camps_long.get(c).copied(),
+        let i = *self.camps.get(&id_key(c).0)?;
+        if self.camp_ids[i as usize] == c {
+            Some(i)
+        } else {
+            None
         }
     }
 }
 
 #[inline]
-fn parse_event(f: &[&[u8]; 7], ctx: &Ctx) -> Option<ERaw> {
+fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, names: &mut LongNames) -> Option<ERaw> {
     if f[0].is_empty() {
         return None;
     }
     let ingest = parse_ingest(f[3]);
+    let (eid, ex) = id_key(f[0]);
     let mut r = ERaw {
-        eid: pack(f[0]),
+        eid,
+        ex,
         user: 0,
         ingest: ((ingest - ctx.ws).div_euclid(1000)).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
         ts: 0,
@@ -883,14 +1025,14 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx) -> Option<ERaw> {
     if kind == 3 {
         r.cat = ctx.cat(f[5]);
     }
-    r.user = pack(f[1]);
+    r.user = user_key(f[1], names);
     r.ts = (ts - ctx.tb) as u32;
     r.kind = kind;
     Some(r)
 }
 
 #[inline]
-fn parse_click(f: &[&[u8]; 4], ctx: &Ctx) -> Option<CRaw> {
+fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, tid: usize, names: &mut LongNames, arena: &mut Vec<u8>) -> Option<CRaw> {
     if f[0].is_empty() || f[1].is_empty() {
         return None;
     }
@@ -900,8 +1042,8 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx) -> Option<CRaw> {
     }
     let camp = ctx.camp(f[2])?;
     Some(CRaw {
-        cid: pack(f[0]),
-        user: pack(f[1]),
+        cid: click_key(f[0], tid, arena),
+        user: user_key(f[1], names),
         ts: (ts - ctx.tb) as u32,
         camp,
     })
@@ -1094,17 +1236,10 @@ fn main() {
     });
     let ncamp = camp_ids.len();
     let mut camps: KMap<u32> = KMap::with_capacity_and_hasher(ncamp * 2, KH);
-    let mut camps_long = std::collections::HashMap::new();
     for (i, c) in camp_ids.iter().enumerate() {
-        match compact(c) {
-            Some(k) => {
-                camps.insert(k, i as u32);
-            }
-            None => {
-                camps_long.insert(c.clone(), i as u32);
-            }
-        }
+        camps.insert(id_key(c).0, i as u32);
     }
+    assert_eq!(camps.len(), ncamp, "campaign key collision");
 
     assert!(we - ws + WEEK < u32::MAX as i64, "window too long");
     let ctx = Ctx {
@@ -1115,7 +1250,7 @@ fn main() {
         products_long,
         unknown_cat,
         camps,
-        camps_long,
+        camp_ids: camp_ids.clone(),
     };
 
     // open input files and cut them into regions
@@ -1152,31 +1287,37 @@ fn main() {
     struct AState {
         ev: Vec<Vec<ERaw>>,
         ck: Vec<CRaw>,
-        lk: Vec<(Key, Key)>,
         buf: Vec<u8>,
+        tid: usize,
+        names: LongNames,
+        arena: Vec<u8>, // text of long click ids
     }
+    let next_tid = AtomicUsize::new(0);
+    assert!(nthreads <= 64);
     // links first (their chunks lead the list), then union-find on its own
     // thread while events and clicks parse
     let nlk = chunks.iter().take_while(|c| c.kind == Kind::Lk).count();
     let lstates = par_tasks(
         nlk,
         nthreads,
-        || (Vec::<(Key, Key)>::new(), Vec::<u8>::new()),
+        || (Vec::<(Key, Key)>::new(), Vec::<u8>::new(), LongNames::default()),
         |st, t| {
             let c = &chunks[t];
             let (f, flen) = &files[c.file];
             let (lo, hi) = load_region(f, *flen, c, &mut st.1);
             let out = &mut st.0;
+            let names = &mut st.2;
             scan::<2>(&st.1[lo..hi], |f| {
                 if !f[0].is_empty() && !f[1].is_empty() {
-                    out.push((pack(f[0]), pack(f[1])));
+                    out.push((user_key(f[0], names), user_key(f[1], names)));
                 }
             });
         },
     );
     let (persons, astates) = std::thread::scope(|sc| {
     let ph = sc.spawn(|| {
-        let p = build_persons(&lstates.iter().map(|s| &s.0[..]).collect::<Vec<_>>());
+        let names = Names { parts: lstates.iter().map(|s| &s.2).collect() };
+        let p = build_persons(&lstates.iter().map(|s| &s.0[..]).collect::<Vec<_>>(), &names);
         eprintln!("[{:?}] persons map {} ids", t0.elapsed(), p.len());
         p
     });
@@ -1186,8 +1327,10 @@ fn main() {
         || AState {
             ev: (0..NB).map(|_| Vec::with_capacity(ev_cap)).collect(),
             ck: Vec::with_capacity(ck_cap),
-            lk: Vec::new(),
             buf: Vec::new(),
+            tid: next_tid.fetch_add(1, Ordering::Relaxed),
+            names: LongNames::default(),
+            arena: Vec::new(),
         },
         |st, t| {
             let c = &chunks[nlk + t];
@@ -1196,21 +1339,23 @@ fn main() {
             let (lo, hi) = load_region(f, *flen, c, &mut buf);
             let bytes = &buf[lo..hi];
             match c.kind {
-                Kind::Ev => scan::<7>(bytes, |f| {
-                    if let Some(r) = parse_event(f, &ctx) {
-                        st.ev[bucket_of(r.eid)].push(r);
-                    }
-                }),
-                Kind::Ck => scan::<4>(bytes, |f| {
-                    if let Some(r) = parse_click(f, &ctx) {
-                        st.ck.push(r);
-                    }
-                }),
-                Kind::Lk => scan::<2>(bytes, |f| {
-                    if !f[0].is_empty() && !f[1].is_empty() {
-                        st.lk.push((pack(f[0]), pack(f[1])));
-                    }
-                }),
+                Kind::Ev => {
+                    let (ev, names) = (&mut st.ev, &mut st.names);
+                    scan::<7>(bytes, |f| {
+                        if let Some(r) = parse_event(f, &ctx, names) {
+                            ev[bucket_of(r.eid)].push(r);
+                        }
+                    })
+                }
+                Kind::Ck => {
+                    let (ck, names, arena, tid) = (&mut st.ck, &mut st.names, &mut st.arena, st.tid);
+                    scan::<4>(bytes, |f| {
+                        if let Some(r) = parse_click(f, &ctx, tid, names, arena) {
+                            ck.push(r);
+                        }
+                    })
+                }
+                Kind::Lk => unreachable!("links are parsed first"),
             }
             st.buf = buf;
         },
@@ -1219,7 +1364,7 @@ fn main() {
     if stop_after == 1 { std::process::exit(0); }
     (ph.join().unwrap(), astates)
     });
-    drop(lstates);
+    let lnames: Vec<LongNames> = lstates.into_iter().map(|s| s.2).collect();
 
     // ---------------- phase B: dedup events, bucket by person
     struct BState {
@@ -1229,7 +1374,6 @@ fn main() {
         dead: Vec<u64>,
     }
     let nck_tasks = astates.len();
-    assert!(nthreads <= 64);
     let bstates = par_tasks(
         NB + nck_tasks,
         nthreads,
@@ -1295,7 +1439,7 @@ fn main() {
                         if e >> 32 == fp {
                             let o = at(e);
                             let oe = o.eid;
-                            if oe == eid {
+                            if oe == eid && o.ex == r.ex {
                                 let (oi, ni) = (o.ingest, r.ingest);
                                 if ni < oi {
                                     kill(e, dead);
@@ -1335,7 +1479,14 @@ fn main() {
             });
         },
     );
-    drop(astates);
+    // keep only the id text; arenas are indexed by the tid inside click keys
+    let mut anames = Vec::new();
+    let mut arenas: Vec<Vec<u8>> = vec![Vec::new(); astates.len()];
+    for a in astates {
+        arenas[a.tid] = a.arena;
+        anames.push(a.names);
+    }
+    let names = Names { parts: lnames.iter().chain(anames.iter()).collect() };
     eprintln!("[{:?}] deduped", t0.elapsed());
     if stop_after == 2 { std::process::exit(0); }
 
@@ -1448,7 +1599,7 @@ fn main() {
                 if cs.len() > 1 {
                     cs.sort_unstable_by(|a, b| {
                         let (at, bt, ac, bc) = (a.ts, b.ts, a.cid, b.cid);
-                        at.cmp(&bt).then_with(|| key_cmp(ac, bc))
+                        at.cmp(&bt).then_with(|| click_cmp(ac, bc, &arenas))
                     });
                 }
                 process_person(lm.keys[l], es, cs, st.view(), ncamp, ndays, day0, tb);
@@ -1484,7 +1635,8 @@ fn main() {
         for (ti, s) in cstates.iter().enumerate() {
             let ud = ud.clone();
             let cats = cats.clone();
-            sc.spawn(move || write_users(&ud.join(format!("part-{ti:04}.parquet")), &s.rows, &cats));
+            let names = &names;
+            sc.spawn(move || write_users(&ud.join(format!("part-{ti:04}.parquet")), &s.rows, &cats, names));
         }
         write_campaigns(
             &cd.join("part-0000.parquet"),
@@ -1816,7 +1968,7 @@ fn batched<T: Copy>(pt: &PTable, items: impl Iterator<Item = T>, user: impl Fn(&
     }
 }
 
-fn build_persons(parts: &[&[(Key, Key)]]) -> PTable {
+fn build_persons(parts: &[&[(Key, Key)]], names: &Names) -> PTable {
     let total: usize = parts.iter().map(|p| p.len()).sum();
     let mut idx: KMap<u32> = KMap::with_capacity_and_hasher(total + total / 2 + 16, KH);
     let mut keys: Vec<Key> = Vec::with_capacity(total);
@@ -1860,7 +2012,7 @@ fn build_persons(parts: &[&[(Key, Key)]]) -> PTable {
         let r = find(&mut parent, i as u32);
         roots[i] = r;
         let cur = name[r as usize];
-        if cur == u64::MAX || key_cmp(keys[i], cur) == std::cmp::Ordering::Less {
+        if cur == u64::MAX || names.cmp(keys[i], cur) == std::cmp::Ordering::Less {
             name[r as usize] = keys[i];
         }
     }
@@ -1886,7 +2038,7 @@ fn to_string(b: Vec<u8>) -> String {
     String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
-fn write_users(path: &Path, rows: &[UserRow], cats: &[Vec<u8>]) {
+fn write_users(path: &Path, rows: &[UserRow], cats: &[Vec<u8>], names: &Names) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
         Field::new("day", DataType::Date32, false),
@@ -1899,7 +2051,17 @@ fn write_users(path: &Path, rows: &[UserRow], cats: &[Vec<u8>]) {
     let mut w = ArrowWriter::try_new(file, schema.clone(), Some(props())).unwrap();
     let cat_s: Vec<String> = cats.iter().map(|c| to_string(c.clone())).collect();
     for part in rows.chunks(1 << 20).chain(if rows.is_empty() { Some(&rows[..]) } else { None }) {
-        let uid: StringArray = part.iter().map(|r| Some(to_string(unpack(r.person)))).collect();
+        // a person's rows are consecutive, so resolve each name once
+        let mut ub = StringBuilder::with_capacity(part.len(), part.len() * 16);
+        let mut last: Option<(Key, String)> = None;
+        for r in part {
+            if last.as_ref().map(|l| l.0) != Some(r.person) {
+                let mut buf = [0u8; 10];
+                last = Some((r.person, to_string(names.bytes(r.person, &mut buf).to_vec())));
+            }
+            ub.append_value(&last.as_ref().unwrap().1);
+        }
+        let uid: StringArray = ub.finish();
         let day: Date32Array = part.iter().map(|r| Some(r.day)).collect();
         let ses: Int64Array = part.iter().map(|r| Some(r.sessions as i64)).collect();
         let ev: Int64Array = part.iter().map(|r| Some(r.events as i64)).collect();
@@ -2087,20 +2249,50 @@ mod tests {
             x
         };
         let alpha: &[u8] = b"0123456789ABCXYZabcxyz _\"\r\t\xc3\xa9";
-        let mut keys: Vec<(Vec<u8>, Key)> = Vec::new();
-        for i in 0..200_000 {
-            let n = (rnd() % 13) as usize;
+        let mut tabs = [LongNames::default(), LongNames::default()];
+        let mut arenas = vec![Vec::new(), Vec::new()];
+        let mut keys: Vec<(Vec<u8>, Key, Key)> = Vec::new();
+        for i in 0..200_000usize {
+            let n = if i % 5 == 0 { 1 + (rnd() % 45) as usize } else { 1 + (rnd() % 13) as usize };
             let lim = if i % 2 == 0 { 22 } else { alpha.len() };
-            let v: Vec<u8> = (0..n).map(|_| alpha[(rnd() % lim as u64) as usize]).collect();
-            let k = pack(&v);
-            assert_eq!(unpack(k), v);
-            keys.push((v, k));
+            let mut v: Vec<u8> = (0..n).map(|_| alpha[(rnd() % lim as u64) as usize]).collect();
+            if i % 7 == 0 && i > 0 {
+                // same prefix as the previous id, so order is decided late
+                v = keys[i - 1].0.clone();
+                v.push(alpha[(rnd() % lim as u64) as usize]);
+            }
+            let k = user_key(&v, &mut tabs[i % 2]);
+            let c = click_key(&v, i % 2, &mut arenas[i % 2]);
+            keys.push((v, k, c));
         }
+        let names = Names { parts: tabs.iter().collect() };
         for w in keys.windows(2) {
-            let (a, ka) = &w[0];
-            let (b, kb) = &w[1];
-            assert_eq!(a.cmp(b), key_cmp(*ka, *kb), "{:?} {:?}", a, b);
+            let (a, ka, ca) = &w[0];
+            let (b, kb, cb) = &w[1];
+            let mut buf = [0u8; 10];
+            assert_eq!(names.bytes(*ka, &mut buf), &a[..]);
+            assert_eq!(a.cmp(b), names.cmp(*ka, *kb), "{:?} {:?}", a, b);
+            assert_eq!(a.cmp(b), click_cmp(*ca, *cb, &arenas), "{:?} {:?}", a, b);
             assert_eq!(a == b, ka == kb);
+        }
+    }
+
+    #[test]
+    fn hash_has_no_collisions_on_near_identical_ids() {
+        let mut seen = std::collections::HashSet::new();
+        let mut low = std::collections::HashSet::new();
+        let base = b"e0abcdefgh0123456789abcdef0123456789abcdef".to_vec();
+        for i in 0..base.len() {
+            for j in 0..base.len() {
+                for d in 0..64u8 {
+                    let mut v = base.clone();
+                    v[i] = v[i].wrapping_add(d);
+                    v[j] = v[j].wrapping_add(d.wrapping_mul(3));
+                    if low.insert(v.clone()) {
+                        assert!(seen.insert(long_key(&v)));
+                    }
+                }
+            }
         }
     }
 
