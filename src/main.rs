@@ -36,83 +36,194 @@ const CHUNK: usize = 8 << 20;
 
 // ---------------------------------------------------------------- keys
 
-type Key = u128;
+/// IDs are 64-bit keys.
+///
+/// * Compact IDs (1..=10 bytes from `[0-9A-Za-z]`, which covers every ID the
+///   generator writes) are an order-preserving base-63 number: byte-wise order
+///   of the strings equals numeric order of the keys, and the top bit is 0.
+/// * Any other ID is interned: top bit 1 plus an index. Equality stays exact;
+///   ordering goes through `key_cmp`, which compares the real bytes.
+type Key = u64;
+const INTERNED: u64 = 1 << 63;
 
-/// Long (>15 byte) strings are interned; key keeps the first 11 bytes for
-/// (approximate) ordering, the intern index for exact equality, and 0xFF as
-/// the length byte. The generator never writes IDs this long.
-struct LongTable {
-    map: std::collections::HashMap<Vec<u8>, u32>,
+static RANK: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = 1 + i as u8;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 26 {
+        t[b'A' as usize + i] = 11 + i as u8;
+        t[b'a' as usize + i] = 37 + i as u8;
+        i += 1;
+    }
+    t
+};
+static UNRANK: [u8; 63] = {
+    let mut t = [0u8; 63];
+    let mut i = 0;
+    while i < 256 {
+        if RANK[i] != 0 {
+            t[RANK[i] as usize] = i as u8;
+        }
+        i += 1;
+    }
+    t
+};
+static POW63: [u64; 11] = {
+    let mut t = [1u64; 11];
+    let mut i = 1;
+    while i < 11 {
+        t[i] = t[i - 1] * 63;
+        i += 1;
+    }
+    t
+};
+
+/// Lane masks keeping the first n bytes.
+static KEEP: [[u8; 16]; 17] = {
+    let mut t = [[0u8; 16]; 17];
+    let mut n = 0;
+    while n <= 16 {
+        let mut j = 0;
+        while j < n {
+            t[n][j] = 0xFF;
+            j += 1;
+        }
+        n += 1;
+    }
+    t
+};
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn compact16(p: *const u8, l: usize) -> Option<Key> {
+    use std::arch::x86_64::*;
+    let v = _mm_loadu_si128(p as *const __m128i);
+    let in_range = |lo: u8, span: u8| {
+        let t = _mm_sub_epi8(v, _mm_set1_epi8(lo as i8));
+        _mm_cmpeq_epi8(_mm_min_epu8(t, _mm_set1_epi8(span as i8)), t)
+    };
+    let dg = in_range(b'0', 9);
+    let up = in_range(b'A', 25);
+    let lo = in_range(b'a', 25);
+    let valid = _mm_or_si128(dg, _mm_or_si128(up, lo));
+    let need = (1u32 << l) - 1;
+    if (_mm_movemask_epi8(valid) as u32) & need != need {
+        return None;
+    }
+    // rank = v - 47 (digit), v - 54 (upper), v - 60 (lower)
+    let off = _mm_or_si128(
+        _mm_and_si128(dg, _mm_set1_epi8(47)),
+        _mm_or_si128(_mm_and_si128(up, _mm_set1_epi8(54)), _mm_and_si128(lo, _mm_set1_epi8(60))),
+    );
+    let r = _mm_and_si128(_mm_sub_epi8(v, off), _mm_loadu_si128(KEEP[l].as_ptr() as *const __m128i));
+    // pairs: r0*63 + r1 ; quads: pair0*3969 + pair1
+    let m1 = _mm_maddubs_epi16(r, _mm_setr_epi8(63, 1, 63, 1, 63, 1, 63, 1, 63, 1, 63, 1, 63, 1, 63, 1));
+    let m2 = _mm_madd_epi16(m1, _mm_setr_epi16(3969, 1, 3969, 1, 3969, 1, 3969, 1));
+    let g0 = _mm_cvtsi128_si32(m2) as u32 as u64; // digits 0..4
+    let g1 = _mm_extract_epi32(m2, 1) as u32 as u64; // digits 4..8
+    let p4 = _mm_extract_epi16(m1, 4) as u32 as u64; // digits 8..10
+    Some(g0 * POW63[6] + g1 * POW63[2] + p4)
+}
+
+/// Compact key, or None when the string needs interning.
+#[inline(always)]
+fn compact(s: &[u8]) -> Option<Key> {
+    let l = s.len();
+    if l > 10 {
+        return None;
+    }
+    if l == 0 {
+        // an empty slice may carry a dangling pointer: never load through it
+        return Some(0);
+    }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        let p = s.as_ptr();
+        if (p as usize & 4095) <= 4096 - 16 {
+            return unsafe { compact16(p, l) };
+        }
+    }
+    let mut v = 0u64;
+    let mut bad = 0u8;
+    for &c in s {
+        let r = RANK[c as usize];
+        bad |= (r == 0) as u8;
+        v = v * 63 + r as u64;
+    }
+    if bad != 0 {
+        return None;
+    }
+    Some(v * POW63[10 - l])
+}
+
+struct Interned {
+    map: std::collections::HashMap<Vec<u8>, u64>,
     strs: Vec<Vec<u8>>,
 }
-static LONG: OnceLock<Mutex<LongTable>> = OnceLock::new();
-fn long_table() -> &'static Mutex<LongTable> {
-    LONG.get_or_init(|| {
-        Mutex::new(LongTable {
-            map: Default::default(),
-            strs: Vec::new(),
-        })
-    })
-}
-
-#[inline]
-fn pack(s: &[u8]) -> Key {
-    let l = s.len();
-    if l <= 15 {
-        let p = s.as_ptr();
-        // A 16-byte load that stays inside the page holding `p` cannot fault.
-        let v = if (p as usize & 4095) <= 4096 - 16 {
-            unsafe { u128::from_be_bytes(std::ptr::read_unaligned(p as *const [u8; 16])) }
-        } else {
-            let mut b = [0u8; 16];
-            b[..l].copy_from_slice(s);
-            u128::from_be_bytes(b)
-        };
-        let mask = if l == 0 { 0 } else { !0u128 << (8 * (16 - l)) };
-        (v & mask) | l as u128
-    } else {
-        pack_long(s)
-    }
+static INTERN: OnceLock<Mutex<Interned>> = OnceLock::new();
+fn intern_table() -> &'static Mutex<Interned> {
+    INTERN.get_or_init(|| Mutex::new(Interned { map: Default::default(), strs: Vec::new() }))
 }
 
 #[cold]
-fn pack_long(s: &[u8]) -> Key {
-    let mut t = long_table().lock().unwrap();
-    let idx = match t.map.get(s) {
-        Some(&i) => i,
-        None => {
-            let i = t.strs.len() as u32;
-            t.strs.push(s.to_vec());
-            t.map.insert(s.to_vec(), i);
-            i
-        }
-    };
-    let mut b = [0u8; 16];
-    b[..11].copy_from_slice(&s[..11]);
-    b[11..15].copy_from_slice(&idx.to_be_bytes());
-    b[15] = 0xFF;
-    u128::from_be_bytes(b)
+fn intern(s: &[u8]) -> Key {
+    let mut t = intern_table().lock().unwrap();
+    if let Some(&k) = t.map.get(s) {
+        return k;
+    }
+    let k = INTERNED | t.strs.len() as u64;
+    t.strs.push(s.to_vec());
+    t.map.insert(s.to_vec(), k);
+    k
 }
 
-fn unpack(k: Key) -> Vec<u8> {
-    let b = k.to_be_bytes();
-    let len = b[15] as usize;
-    if len <= 15 {
-        b[..len].to_vec()
-    } else {
-        let idx = u32::from_be_bytes([b[11], b[12], b[13], b[14]]) as usize;
-        long_table().lock().unwrap().strs[idx].clone()
+#[inline(always)]
+fn pack(s: &[u8]) -> Key {
+    match compact(s) {
+        Some(k) => k,
+        None => intern(s),
     }
 }
 
+fn unpack(k: Key) -> Vec<u8> {
+    if k & INTERNED != 0 {
+        return intern_table().lock().unwrap().strs[(k & !INTERNED) as usize].clone();
+    }
+    let mut out = Vec::with_capacity(10);
+    let mut v = k;
+    let mut digits = [0u8; 10];
+    for i in (0..10).rev() {
+        digits[i] = (v % 63) as u8;
+        v /= 63;
+    }
+    for d in digits {
+        if d == 0 {
+            break;
+        }
+        out.push(UNRANK[d as usize]);
+    }
+    out
+}
+
+/// Byte-wise order of the IDs behind two keys.
 #[inline]
-fn mix(k: u128) -> u64 {
-    let hi = (k >> 64) as u64;
-    let lo = k as u64;
-    let mut x = hi.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ lo;
-    x = (x ^ (x >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x ^= x >> 32;
-    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+fn key_cmp(a: Key, b: Key) -> std::cmp::Ordering {
+    if (a | b) & INTERNED == 0 {
+        a.cmp(&b)
+    } else {
+        unpack(a).cmp(&unpack(b))
+    }
+}
+
+#[inline(always)]
+fn mix(k: u64) -> u64 {
+    let mut x = k ^ 0x9E37_79B9_7F4A_7C15;
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
 }
 
@@ -139,8 +250,8 @@ impl Hasher for KHasher {
             self.0 = (self.0.rotate_left(5) ^ x as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
         }
     }
-    fn write_u128(&mut self, v: u128) {
-        self.0 = mix(v ^ 0x5bd1_e995_7f4a_7c15_c2b2_ae3d_27d4_eb4f).rotate_left(23);
+    fn write_u64(&mut self, v: u64) {
+        self.0 = mix(v ^ 0x5bd1_e995_7f4a_7c15).rotate_left(23);
     }
 }
 type KMap<V> = HashMap<Key, V, KH>;
@@ -255,13 +366,14 @@ fn scan<const N: usize>(data: &[u8], mut f: impl FnMut(&[&[u8]; N])) {
         let mut st = ls;
         for j in 0..N {
             let e = ends[j];
-            let fld = &data[st..e];
+            // SAFETY: ls <= ends[0] < ends[1] < ... <= data.len() by construction
+            let fld = unsafe { data.get_unchecked(st..e) };
             if qn[j] != 0 {
                 let l = fld.len();
                 if qn[j] != 2 || l < 2 || fld[0] != b'"' || fld[l - 1] != b'"' {
                     return;
                 }
-                out[j] = &fld[1..l - 1];
+                out[j] = unsafe { fld.get_unchecked(1..l - 1) };
             } else {
                 out[j] = fld;
             }
@@ -518,6 +630,47 @@ fn civil_old(s: &[u8]) -> Option<i64> {
 
 const HUGE: i64 = i64::MAX / 4;
 
+/// Shuffle masks that right-align the first n bytes of a 16-byte lane.
+const SHUF: [[u8; 16]; 17] = {
+    let mut t = [[0x80u8; 16]; 17];
+    let mut n = 0;
+    while n <= 16 {
+        let mut j = 0;
+        while j < 16 {
+            if j >= 16 - n {
+                t[n][j] = (j - (16 - n)) as u8;
+            }
+            j += 1;
+        }
+        n += 1;
+    }
+    t
+};
+
+/// Parses 1..=16 ASCII digits at `p` (16 bytes must be readable); None if any
+/// of the first n bytes is not a digit.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn digits16(p: *const u8, n: usize) -> Option<u64> {
+    use std::arch::x86_64::*;
+    let v = _mm_loadu_si128(p as *const __m128i);
+    let t = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+    let ok = _mm_cmpeq_epi8(_mm_min_epu8(t, _mm_set1_epi8(9)), t);
+    let m = _mm_movemask_epi8(ok) as u32;
+    let need = (1u32 << n) - 1;
+    if m & need != need {
+        return None;
+    }
+    let a = _mm_shuffle_epi8(t, _mm_loadu_si128(SHUF[n].as_ptr() as *const __m128i));
+    let m1 = _mm_maddubs_epi16(a, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+    let m2 = _mm_madd_epi16(m1, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+    let m3 = _mm_packus_epi32(m2, m2);
+    let m4 = _mm_madd_epi16(m3, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+    let hi = _mm_cvtsi128_si32(m4) as u32 as u64;
+    let lo = _mm_extract_epi32(m4, 1) as u32 as u64;
+    Some(hi * 100_000_000 + lo)
+}
+
 /// `ingest_ts` is always valid F1 per the rules; parse it without validation
 /// when it has the F1 shape, else fall back to the full parser.
 #[inline(always)]
@@ -555,6 +708,13 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
     if n == 0 {
         return None;
     }
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        let p = s.as_ptr();
+        if n <= 16 && (p as usize & 4095) <= 4096 - 16 {
+            return unsafe { digits16(p, n) }.map(|v| v as i64);
+        }
+    }
     // F3: ASCII digits only, any length; huge values saturate (outside every window)
     let mut v: i64 = 0;
     let mut big = false;
@@ -569,7 +729,7 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
             v = v * 10 + d as i64;
         }
     }
-    Some(if big { HUGE } else { v })
+    Some(if big || v > 100_000_000_000_000_000 { HUGE } else { v })
 }
 
 #[inline]
@@ -660,18 +820,16 @@ struct Ctx {
 impl Ctx {
     #[inline]
     fn cat(&self, p: &[u8]) -> u16 {
-        if p.len() <= 15 {
-            *self.products.get(&pack(p)).unwrap_or(&self.unknown_cat)
-        } else {
-            *self.products_long.get(p).unwrap_or(&self.unknown_cat)
+        match compact(p) {
+            Some(k) => *self.products.get(&k).unwrap_or(&self.unknown_cat),
+            None => *self.products_long.get(p).unwrap_or(&self.unknown_cat),
         }
     }
     #[inline]
     fn camp(&self, c: &[u8]) -> Option<u32> {
-        if c.len() <= 15 {
-            self.camps.get(&pack(c)).copied()
-        } else {
-            self.camps_long.get(c).copied()
+        match compact(c) {
+            Some(k) => self.camps.get(&k).copied(),
+            None => self.camps_long.get(c).copied(),
         }
     }
 }
@@ -694,11 +852,20 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx) -> Option<ERaw> {
     if f[1].is_empty() || f[5].is_empty() {
         return Some(r);
     }
-    let kind = match f[4] {
-        b"view" => 1,
-        b"cart" => 2,
-        b"purchase" => 3,
-        _ => return Some(r),
+    let t = f[4];
+    let kind = if t.len() == 4 {
+        let w = u32::from_le_bytes([t[0], t[1], t[2], t[3]]);
+        if w == u32::from_le_bytes(*b"view") {
+            1
+        } else if w == u32::from_le_bytes(*b"cart") {
+            2
+        } else {
+            return Some(r);
+        }
+    } else if t.len() == 8 && u64::from_le_bytes(t[..8].try_into().unwrap()) == u64::from_le_bytes(*b"purchase") {
+        3
+    } else {
+        return Some(r);
     };
     let ts = match parse_ts(f[2]) {
         Some(t) if t >= ctx.ws && t < ctx.we => t,
@@ -908,10 +1075,13 @@ fn main() {
     let mut products_long = std::collections::HashMap::new();
     for (p, c) in &prod_raw {
         let ci = cat_idx[c];
-        if p.len() <= 15 {
-            products.insert(pack(p), ci);
-        } else {
-            products_long.insert(p.clone(), ci);
+        match compact(p) {
+            Some(k) => {
+                products.insert(k, ci);
+            }
+            None => {
+                products_long.insert(p.clone(), ci);
+            }
         }
     }
 
@@ -926,10 +1096,13 @@ fn main() {
     let mut camps: KMap<u32> = KMap::with_capacity_and_hasher(ncamp * 2, KH);
     let mut camps_long = std::collections::HashMap::new();
     for (i, c) in camp_ids.iter().enumerate() {
-        if c.len() <= 15 {
-            camps.insert(pack(c), i as u32);
-        } else {
-            camps_long.insert(c.clone(), i as u32);
+        match compact(c) {
+            Some(k) => {
+                camps.insert(k, i as u32);
+            }
+            None => {
+                camps_long.insert(c.clone(), i as u32);
+            }
         }
     }
 
@@ -1273,7 +1446,10 @@ fn main() {
                 }
                 let cs = &mut cks[cstart[l] as usize..cstart[l + 1] as usize];
                 if cs.len() > 1 {
-                    cs.sort_unstable_by_key(|x| (x.ts, x.cid));
+                    cs.sort_unstable_by(|a, b| {
+                        let (at, bt, ac, bc) = (a.ts, b.ts, a.cid, b.cid);
+                        at.cmp(&bt).then_with(|| key_cmp(ac, bc))
+                    });
                 }
                 process_person(lm.keys[l], es, cs, st.view(), ncamp, ndays, day0, tb);
             }
@@ -1678,12 +1854,13 @@ fn build_persons(parts: &[&[(Key, Key)]]) -> PTable {
         }
     }
     let n = keys.len();
-    let mut name: Vec<Key> = vec![u128::MAX; n];
+    let mut name: Vec<Key> = vec![u64::MAX; n];
     let mut roots = vec![0u32; n];
     for i in 0..n {
         let r = find(&mut parent, i as u32);
         roots[i] = r;
-        if keys[i] < name[r as usize] {
+        let cur = name[r as usize];
+        if cur == u64::MAX || key_cmp(keys[i], cur) == std::cmp::Ordering::Less {
             name[r as usize] = keys[i];
         }
     }
@@ -1799,4 +1976,157 @@ fn write_campaigns(
     let mut w = ArrowWriter::try_new(file, schema, Some(props())).unwrap();
     w.write(&batch).unwrap();
     w.close().unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Straightforward scalar reading of the timestamp rules.
+    fn ts_ref(s: &[u8]) -> Option<i64> {
+        if s.is_empty() {
+            return None;
+        }
+        if s.iter().all(|c| c.is_ascii_digit()) {
+            let mut v: i128 = 0;
+            for &c in s {
+                v = (v * 10 + (c - b'0') as i128).min(1 << 100);
+            }
+            return Some(if v > 100_000_000_000_000_000 { HUGE } else { v as i64 });
+        }
+        let civ = |b: &[u8]| -> Option<i64> {
+            let st = std::str::from_utf8(b).ok()?;
+            let bs = st.as_bytes();
+            if bs.len() != 19 || bs[4] != b'-' || bs[7] != b'-' || bs[10] != b'T' || bs[13] != b':' || bs[16] != b':' {
+                return None;
+            }
+            let num = |r: std::ops::Range<usize>| -> Option<i64> {
+                if bs[r.clone()].iter().all(|c| c.is_ascii_digit()) { st[r].parse().ok() } else { None }
+            };
+            let (y, mo, d, h, mi, se) = (num(0..4)?, num(5..7)?, num(8..10)?, num(11..13)?, num(14..16)?, num(17..19)?);
+            if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 || d < 1 {
+                return None;
+            }
+            let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+            let dim = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo as usize - 1];
+            if d > dim {
+                return None;
+            }
+            Some(days_from_civil(y, mo, d) * DAY + h * 3_600_000 + mi * 60_000 + se * 1000)
+        };
+        if s.len() == 20 && s[19] == b'Z' {
+            return civ(&s[..19]);
+        }
+        if s.len() == 25 && (s[19] == b'+' || s[19] == b'-') && s[22] == b':' {
+            let b = civ(&s[..19])?;
+            if !s[20..22].iter().chain(&s[23..25]).all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let oh = ((s[20] - b'0') * 10 + (s[21] - b'0')) as i64;
+            let om = ((s[23] - b'0') * 10 + (s[24] - b'0')) as i64;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off = (oh * 60 + om) * 60_000;
+            return Some(if s[19] == b'+' { b - off } else { b + off });
+        }
+        None
+    }
+
+    #[test]
+    fn parse_ts_matches_reference() {
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet = b"0123456789-T:Z+ .ez\xd9";
+        let templates: [&[u8]; 6] = [
+            b"2027-12-19T18:13:05Z",
+            b"2028-02-29T23:59:59Z",
+            b"2027-02-28T00:00:00+05:30",
+            b"1791071890000",
+            b"0001791071890000",
+            b"2026-10-04T01:30:00-00:00",
+        ];
+        // keep each case inside a big buffer so 16-byte reads stay in bounds
+        let mut buf = vec![0u8; 8192];
+        for i in 0..2_000_000u64 {
+            let mut v: Vec<u8> = if i % 3 == 0 {
+                let n = (rnd() % 26) as usize;
+                (0..n).map(|_| alphabet[(rnd() % alphabet.len() as u64) as usize]).collect()
+            } else {
+                let mut t = templates[(rnd() % 6) as usize].to_vec();
+                let k = (rnd() % 4) as usize;
+                for _ in 0..k {
+                    let pos = (rnd() as usize) % t.len();
+                    t[pos] = alphabet[(rnd() % 10) as usize];
+                }
+                t
+            };
+            if i % 7 == 0 {
+                v = (0..(rnd() % 24) as usize).map(|_| b'0' + (rnd() % 10) as u8).collect();
+            }
+            let off = 4000 + (rnd() % 200) as usize;
+            buf[off..off + v.len()].copy_from_slice(&v);
+            buf[off + v.len()..off + v.len() + 20].fill(b'7');
+            let got = parse_ts(&buf[off..off + v.len()]);
+            assert_eq!(got, ts_ref(&v), "input {:?}", String::from_utf8_lossy(&v));
+        }
+    }
+
+    #[test]
+    fn keys_roundtrip_and_order() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alpha: &[u8] = b"0123456789ABCXYZabcxyz _\"\r\t\xc3\xa9";
+        let mut keys: Vec<(Vec<u8>, Key)> = Vec::new();
+        for i in 0..200_000 {
+            let n = (rnd() % 13) as usize;
+            let lim = if i % 2 == 0 { 22 } else { alpha.len() };
+            let v: Vec<u8> = (0..n).map(|_| alpha[(rnd() % lim as u64) as usize]).collect();
+            let k = pack(&v);
+            assert_eq!(unpack(k), v);
+            keys.push((v, k));
+        }
+        for w in keys.windows(2) {
+            let (a, ka) = &w[0];
+            let (b, kb) = &w[1];
+            assert_eq!(a.cmp(b), key_cmp(*ka, *kb), "{:?} {:?}", a, b);
+            assert_eq!(a == b, ka == kb);
+        }
+    }
+
+    #[test]
+    fn scan_matches_scalar_rules() {
+        let cases: [&[u8]; 9] = [
+            b"a,b\n\"a\",\"\"\n\"a,b\n,\n\n\"\"\"\",x\na\"b,c\n\"a\",b",
+            b"x,y",
+            b"\n\n\n",
+            b"\"q\",\"r\"\r\n",
+            b"a,b,c\na,b\n",
+            b"\"\",\"\"\n",
+            b"\"a\"b,c\n",
+            b"a,\"b\n",
+            b"\",a\n",
+        ];
+        for c in cases {
+            let mut got = Vec::new();
+            scan::<2>(c, |f| got.push((f[0].to_vec(), f[1].to_vec())));
+            let mut want = Vec::new();
+            for line in c.split(|&b| b == b'\n') {
+                if let Some(f) = split::<2>(line) {
+                    want.push((f[0].to_vec(), f[1].to_vec()));
+                }
+            }
+            assert_eq!(got, want, "case {:?}", String::from_utf8_lossy(c));
+        }
+    }
 }
